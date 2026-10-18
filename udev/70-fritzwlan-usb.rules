@@ -1,0 +1,10 @@
+# AVM FRITZ!WLAN USB Stick v1.1: comes up as a virtual CD-ROM (057c:62ff) with
+# the Windows driver. Ejecting it switches the stick to WLAN mode (057c:6201),
+# where acx-mac80211 binds through its modalias. (Without the eject the stick
+# switches by itself after ~25 s.)
+# eject runs as a transient unit after the udev event, not inside the udev
+# worker, where it ran while cdrom_id still had the drive and did nothing.
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="sr[0-9]*", \
+  ATTRS{idVendor}=="057c", ATTRS{idProduct}=="62ff", \
+  ENV{UDISKS_IGNORE}="1", \
+  RUN+="/usr/bin/systemd-run --no-block --collect --unit=fritzwlan-eject-%k /usr/bin/eject /dev/%k"
