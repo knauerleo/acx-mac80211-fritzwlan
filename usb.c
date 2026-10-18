@@ -927,6 +927,10 @@ static void acxusb_rx_tnetw1450(acx_device_t *adev, u8 *buf, int size)
 				print_hex_dump(KERN_INFO, "acxusb txstat: ", DUMP_PREFIX_OFFSET,
 					       16, 1, rec, min(total, 48), false);
 			acxusb_handle_txstat(adev, (usb_txstatus_t *)rxbuf);
+		} else if ((le16_to_cpu(rxbuf->mac_cnt_rcvd) & 0xfff) == 0) {
+			if (net_ratelimit())
+				print_hex_dump(KERN_INFO, "acxusb rec0: ", DUMP_PREFIX_OFFSET,
+					       16, 1, rec, min(total, 64), false);
 		} else if (RXBUF_BYTES_USED(rxbuf) > plen) {
 			printk_ratelimited(KERN_WARNING "acxusb: rx frame len %d exceeds "
 					   "record %d\n", RXBUF_BYTES_USED(rxbuf), plen);
@@ -1241,8 +1245,9 @@ static void acxusb_complete_tx(struct urb *urb)
 		return;
 	}
 
-	//	pr_acx("RETURN TX (%d): status=%d size=%d\n",
-	//		txnum, urb->status, urb->actual_length);
+	if (net_ratelimit())
+		pr_info("acxusb: tx urb done: status=%d actual=%d\n",
+			urb->status, urb->actual_length);
 
 	/* handle USB transfer errors */
 	switch (urb->status) {
@@ -1379,6 +1384,12 @@ void acxusb_tx_data(acx_device_t *adev, tx_t *tx_opaque, int wlanpkt_len,
 	    );
 
 	txurb->transfer_flags = URB_ASYNC_UNLINK | URB_ZERO_PACKET;
+	if (net_ratelimit()) {
+		pr_info("acxusb: tx urb %d: %d bytes\n", txnum,
+			wlanpkt_len + USB_TXBUF_HDRSIZE);
+		print_hex_dump(KERN_INFO, "acxusb tx: ", DUMP_PREFIX_OFFSET, 16, 1,
+			       txbuf, min(wlanpkt_len + USB_TXBUF_HDRSIZE, 48), false);
+	}
 	ucode = usb_submit_urb(txurb, GFP_ATOMIC);
 	log(L_USBRXTX, "SUBMIT TX (%d): outpipe=0x%X buf=%p txsize=%d "
 	    "rate=%u errcode=%d\n", txnum, outpipe, txbuf,
