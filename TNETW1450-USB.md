@@ -58,6 +58,14 @@ does *not* work on a booted stick. The chip re-enumerates as **0451:60c5**
 sends no ready message, and accepts about 6 KB of a firmware upload before the
 bulk-out times out. Only replugging recovers it.
 
+Milder host-side resets tried instead, all **worse than doing nothing**: a
+`usb_clear_halt()` on both bulk endpoints before re-uploading the firmware
+makes the upload itself time out (-110); `usb_clear_halt()` on the OUT
+endpoint only makes the upload succeed only sometimes; `usb_reset_endpoint()`
+(host-side toggle reset, no bus traffic) makes the upload fail outright. The
+boot ROM simply ignores `CLEAR_FEATURE` for the data toggle. After any of
+these a replug is needed, same as after a port reset.
+
 ## Bulk-IN records (device → host)
 
 A transfer contains one or more records. The first word of each record is:
@@ -113,6 +121,12 @@ Example: `18 80 3d ea 00 00 00 00 40 00 01 00 00 00 00 00 00 00 00 00 00 00 00 0
 There is no host cookie in it, and Windows only counts completions per queue
 (FUN_0004317e). The driver completes skbs on URB completion and ignores these
 records except for debugging.
+
+The firmware itself sometimes transmits frames the host never queued: type-2
+status records with frame control `0x0040` (probe request) show up on an
+idle, associated link. Seen with the monitor sniffer (`tools/rx-sniff.py`)
+and matching type-2 dumps; harmless, but a reason not to assume every tx
+status corresponds to a host-submitted skb.
 
 ## Bulk-OUT tx frame (host → device)
 
@@ -201,6 +215,12 @@ Still relevant if sensitivity at a distance turns out to be poor.
   index; rx stats use-after-free; tx rate stored in u8 (540 = 54M overflowed).
 - rx signal reported as `SIGNAL_UNSPEC` 0..100: mac80211's beacon EWMA wrapped,
   garbage CQM RSSI events made wpa_supplicant bgscan scan nonstop (~50 % loss).
-  Now dBm (`acx_signal_to_dbm`).
+  Now dBm (`acx_signal_to_dbm`, commit 5662f64).
+- Firmware upload padding counted 2048-byte transfers instead of
+  wMaxPacketSize (512-byte) packets (see "Firmware boot" step 3). The two
+  rules disagree for `FwUSB1b.bin`, so on every other boot (padding state
+  survives `CMD_RESET`) the firmware held each bulk-out tx frame until the
+  next one arrived: exactly 50 % ping loss, alternating, at any tx rate.
+  Now counts packets like AVM's glue (commit 64efc85).
 - `debugflags=` name table is shifted against the real bit values. Use the
   numeric `debug=` instead (0x8282 = USBRXTX|XFER|DEBUG|INIT; 0x100 = L_DATA).
