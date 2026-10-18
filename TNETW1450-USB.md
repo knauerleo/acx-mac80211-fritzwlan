@@ -35,9 +35,11 @@ Endpoints: EP1 OUT bulk 512, EP2 IN bulk 512 (high speed). Commands
 2. Firmware file `tiacx111usbc1B` = `FwUSB1b.bin` from the CD:
    `le32 checksum, le32 size, data`. Checksum = byte sum over bytes 4..end.
 3. Header to EP1: `u16 0xc000, u16 0x000b, u32 len, u32 size, u32 checksum`.
-   `len = size-4` if padding else `size-8`. Padding uses acx's original rule with
-   divisor 2048, which works. The Windows code seemed to divide by
-   wMaxPacketSize, but that **did not work**.
+   `len = size-4` if padding else `size-8`. **Pad when the image takes an even
+   number of wMaxPacketSize packets** (AVM `os_usb_need_file_padding`, also
+   fwlanusb.sys): `((size-1)/512+1) % 2 == 0`. acx's rule (2048-byte transfers)
+   pads FwUSB1b.bin wrongly; the firmware still boots, but on every other boot
+   it then sends each tx frame only when the next bulk-out transfer arrives.
 4. Data in 2048-byte blocks, each u32 byte-swapped (be32). Optionally 4 zero
    bytes for padding.
 5. Read a 20-byte response: `u32[1] == 0` and `u16[8] == 1`. `0x40000003` means error.
