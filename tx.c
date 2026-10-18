@@ -165,7 +165,7 @@ void acx_tx_queue_flush(acx_device_t *adev)
 		if (!(info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS))
 			continue;
 
-		ieee80211_tx_status(adev->hw, skb);
+		ieee80211_tx_status_skb(adev->hw, skb);
 	}
 }
 

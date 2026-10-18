@@ -111,7 +111,7 @@ DECL_OR_STUB ( PCI_OR_MEM,
 	{ return 0; } )
 
 DECL_OR_STUB ( PCI_OR_MEM,
-	void acx_op_stop(struct ieee80211_hw *hw),
+	void acx_op_stop(struct ieee80211_hw *hw, bool suspend),
 	{ } )
 
 DECL_OR_STUB ( PCI_OR_MEM,

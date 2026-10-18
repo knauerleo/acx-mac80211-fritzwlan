@@ -1001,7 +1001,7 @@ static void acxusb_complete_rx(struct urb *urb)
 		txstatus->status.rates[0].count = stat->ack_failures + 1;
 
 		// report upstream
-		ieee80211_tx_status(adev->hw, skb);
+		ieee80211_tx_status_skb(adev->hw, skb);
 
 		tx->busy = 0;
 		adev->hw_tx_queue[0].free++;
@@ -1447,7 +1447,7 @@ static int acxusb_op_start(struct ieee80211_hw *hw)
  * transfers, these are unlinked (asynchronously). The module in-use count
  * is also decreased in this function.
  */
-static void acxusb_op_stop(struct ieee80211_hw *hw)
+static void acxusb_op_stop(struct ieee80211_hw *hw, bool suspend)
 {
 	acx_device_t *adev = hw2adev(hw);
 	int i;
@@ -1495,6 +1495,11 @@ static void acxusb_op_stop(struct ieee80211_hw *hw)
 
 static const struct ieee80211_ops acxusb_hw_ops = {
 	.tx = acx_op_tx,
+	.wake_tx_queue = ieee80211_handle_wake_tx_queue,
+	.add_chanctx = ieee80211_emulate_add_chanctx,
+	.remove_chanctx = ieee80211_emulate_remove_chanctx,
+	.change_chanctx = ieee80211_emulate_change_chanctx,
+	.switch_vif_chanctx = ieee80211_emulate_switch_vif_chanctx,
 	.conf_tx = acx_conf_tx,
 	.add_interface = acx_op_add_interface,
 	.remove_interface = acx_op_remove_interface,

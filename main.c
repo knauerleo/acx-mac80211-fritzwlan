@@ -164,7 +164,7 @@ static int acx_do_job_update_tim(acx_device_t *adev)
 
 #if CONFIG_ACX_MAC80211_VERSION > KERNEL_VERSION(2, 6, 32)
 	beacon = ieee80211_beacon_get_tim(adev->hw, adev->vif, &tim_offset,
-			&tim_length);
+			&tim_length, 0);
 #else
 	beacon = ieee80211_beacon_get(adev->hw, adev->vif);
 	if (!beacon)
@@ -497,7 +497,7 @@ int acx_free_mechanics(acx_device_t *adev)
 
 int acx_init_ieee80211(acx_device_t *adev, struct ieee80211_hw *hw)
 {
-	hw->flags &= ~IEEE80211_HW_RX_INCLUDES_FCS;
+	__clear_bit(IEEE80211_HW_RX_INCLUDES_FCS, hw->flags);
 	hw->queues = 1;
 	hw->wiphy->max_scan_ssids = 1;
 
@@ -525,14 +525,14 @@ int acx_init_ieee80211(acx_device_t *adev, struct ieee80211_hw *hw)
 	/* We base signal quality on winlevel approach of previous driver
 	 * TODO OW 20100615 This should into a common init code
 	 */
-	hw->flags |= IEEE80211_HW_SIGNAL_UNSPEC;
+	ieee80211_hw_set(hw, SIGNAL_UNSPEC);
 	hw->max_signal = 100;
 
 	if (IS_ACX100(adev)) {
-		adev->hw->wiphy->bands[IEEE80211_BAND_2GHZ] =
+		adev->hw->wiphy->bands[NL80211_BAND_2GHZ] =
 			&acx100_band_2GHz;
 	} else if (IS_ACX111(adev))
-		adev->hw->wiphy->bands[IEEE80211_BAND_2GHZ] =
+		adev->hw->wiphy->bands[NL80211_BAND_2GHZ] =
 			&acx111_band_2GHz;
 	else {
 		log(L_ANY, "Error: Unknown device");
@@ -654,7 +654,7 @@ void acx_op_remove_interface(struct ieee80211_hw *hw, struct ieee80211_VIF *vif)
 	acx_sem_unlock(adev);
 }
 
-int acx_op_config(struct ieee80211_hw *hw, u32 changed)
+int acx_op_config(struct ieee80211_hw *hw, int radio_idx, u32 changed)
 {
 	acx_device_t *adev = hw2adev(hw);
 	struct ieee80211_conf *conf = &hw->conf;
@@ -706,7 +706,7 @@ int acx_op_config(struct ieee80211_hw *hw, u32 changed)
 }
 
 void acx_op_bss_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
-			struct ieee80211_bss_conf *info, u32 changed)
+			struct ieee80211_bss_conf *info, u64 changed)
 {
 	acx_device_t *adev = hw2adev(hw);
 
@@ -733,7 +733,7 @@ void acx_op_bss_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	if (changed & BSS_CHANGED_BEACON) {
 
 		/* TODO Use ieee80211_beacon_get_tim instead */
-		beacon = ieee80211_beacon_get(hw, vif);
+		beacon = ieee80211_beacon_get(hw, vif, 0);
 		if (!beacon) {
 			pr_err("Error: BSS_CHANGED_BEACON: skb_tmp==NULL");
 			goto end_sem_unlock;
@@ -945,7 +945,7 @@ void acx_op_configure_filter(struct ieee80211_hw *hw,
 		changed_flags, *total_flags);
 
 	/* OWI TODO: Set also FIF_PROBE_REQ ? */
-	*total_flags &= (FIF_PROMISC_IN_BSS | FIF_ALLMULTI | FIF_FCSFAIL
+	*total_flags &= (FIF_ALLMULTI | FIF_FCSFAIL
 			| FIF_CONTROL | FIF_OTHER_BSS);
 
 	logf1(L_DEBUG, "2: *total_flags=0x%08x\n", *total_flags);
@@ -956,7 +956,7 @@ void acx_op_configure_filter(struct ieee80211_hw *hw,
 
 #if CONFIG_ACX_MAC80211_VERSION >= KERNEL_VERSION(3, 2, 0)
 int acx_conf_tx(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
-		u16 queue, const struct ieee80211_tx_queue_params *params)
+		unsigned int link_id, u16 queue, const struct ieee80211_tx_queue_params *params)
 #else
 int acx_conf_tx(struct ieee80211_hw *hw, u16 queue,
 		const struct ieee80211_tx_queue_params *params)
@@ -1045,8 +1045,9 @@ void acx_op_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *control,
 }
 
 int acx_op_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
-                   struct cfg80211_scan_request *req)
+                   struct ieee80211_scan_request *hw_req)
 {
+	struct cfg80211_scan_request *req = &hw_req->req;
 	acx_device_t *adev = hw2adev(hw);
 	struct sk_buff *skb;
 	size_t ssid_len = 0;
@@ -1082,7 +1083,7 @@ int acx_op_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 		goto out;
 	}
 #else
-	skb = ieee80211_probereq_get(adev->hw, adev->vif, ssid, ssid_len,
+	skb = ieee80211_probereq_get(adev->hw, adev->vif->addr, ssid, ssid_len,
 		req->ie_len);
 	if (!skb) {
 		ret = -ENOMEM;

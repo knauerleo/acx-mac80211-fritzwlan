@@ -661,6 +661,11 @@ more bytes may follow
 
 static const struct ieee80211_ops acxpci_hw_ops = {
 	.tx		= acx_op_tx,
+	.wake_tx_queue = ieee80211_handle_wake_tx_queue,
+	.add_chanctx = ieee80211_emulate_add_chanctx,
+	.remove_chanctx = ieee80211_emulate_remove_chanctx,
+	.change_chanctx = ieee80211_emulate_change_chanctx,
+	.switch_vif_chanctx = ieee80211_emulate_switch_vif_chanctx,
 	.conf_tx	= acx_conf_tx,
 	.start		= acx_op_start,
 	.stop		= acx_op_stop,
@@ -1495,7 +1500,7 @@ static struct acxpci_device_info acxpci_info_tbl[] __devinitdata = {
 #endif
 
 #ifdef CONFIG_PCI
-static DEFINE_PCI_DEVICE_TABLE(acxpci_id_tbl) = {
+static const struct pci_device_id acxpci_id_tbl[] = {
 	{ PCI_VDEVICE(TI, PCI_DEVICE_ID_TI_TNETW1100A),
 	  .driver_data = CHIPTYPE_ACX100,
 	},

@@ -16,6 +16,7 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <linux/string.h>
 #include "acx_debug.h"
 
 #include "acx.h"
@@ -159,7 +160,7 @@ int acx_set_channel(acx_device_t *adev, u8 channel, int freq)
 	int res = 0;
 
 	adev->rx_status.freq = freq;
-	adev->rx_status.band = IEEE80211_BAND_2GHZ;
+	adev->rx_status.band = NL80211_BAND_2GHZ;
 
 	adev->channel = channel;
 
@@ -1809,7 +1810,7 @@ void acx_set_defaults(acx_device_t *adev)
 
 	/* we have a nick field to waste, so why not abuse it
 	 * to announce the driver version? ;-) */
-	strncpy(adev->nick, "acx " ACX_RELEASE, IW_ESSID_MAX_SIZE);
+	strscpy_pad(adev->nick, "acx " ACX_RELEASE);
 
 	if (IS_PCI(adev)) {	/* FIXME: this should be made to apply to USB, too! */
 		/* first regulatory domain entry in EEPROM == default

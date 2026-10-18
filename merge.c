@@ -2247,7 +2247,7 @@ void _acx_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len,
 		acxmem_update_queue_indicator(adev, 0);
 
 	/* flush writes before we tell the adapter that it's its turn now */
-	mmiowb();
+	wmb();
 	write_reg16(adev, IO_ACX_INT_TRIG, INT_TRIG_TXPRC);
 	write_flush(adev);
 
@@ -2460,7 +2460,7 @@ unsigned int acx_tx_clean_txdesc(acx_device_t *adev, int queue_id)
 		else {
 #if CONFIG_ACX_MAC80211_VERSION < KERNEL_VERSION(2, 6, 37)
 			local_bh_disable();
-			ieee80211_tx_status(adev->hw, hostdesc->skb);
+			ieee80211_tx_status_skb(adev->hw, hostdesc->skb);
 			local_bh_enable();
 #else
 			ieee80211_tx_status_ni(adev->hw, hostdesc->skb);
@@ -2776,7 +2776,10 @@ void acx_irq_work(struct work_struct *work)
 		/* HOST_INT_SCAN_COMPLETE */
 		if (irqmasked & HOST_INT_SCAN_COMPLETE) {
 			if (test_bit(ACX_FLAG_SCANNING, &adev->flags)) {
-				ieee80211_scan_completed(adev->hw, false);
+				{
+					struct cfg80211_scan_info info = { .aborted = false };
+					ieee80211_scan_completed(adev->hw, &info);
+				}
 				log(L_INIT, "scan completed\n");
 				clear_bit(ACX_FLAG_SCANNING, &adev->flags);
 			}
@@ -3141,7 +3144,10 @@ void acx_stop(acx_device_t *adev)
 	acxmem_lock_flags;
 
 	if (test_bit(ACX_FLAG_SCANNING, &adev->flags)) {
-		ieee80211_scan_completed(adev->hw, true);
+		{
+		struct cfg80211_scan_info info = { .aborted = true };
+		ieee80211_scan_completed(adev->hw, &info);
+		}
 		acx_issue_cmd(adev, ACX1xx_CMD_STOP_SCAN, NULL, 0);
 		clear_bit(ACX_FLAG_SCANNING, &adev->flags);
 	}
@@ -3167,7 +3173,7 @@ void acx_stop(acx_device_t *adev)
 }
 
 
-void acx_op_stop(struct ieee80211_hw *hw)
+void acx_op_stop(struct ieee80211_hw *hw, bool suspend)
 {
 	acx_device_t *adev = hw2adev(hw);
 

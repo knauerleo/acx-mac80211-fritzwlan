@@ -8,3 +8,6 @@ Module.symvers
 modules.order
 *~
 *.patch
+build.log
+*.mod
+.*.cmd
