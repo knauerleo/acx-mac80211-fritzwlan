@@ -29,7 +29,11 @@
 static int acx_is_hw_tx_queue_stop_limit(acx_device_t *adev)
 {
 	int i;
-	for (i=0; i<adev->num_hw_tx_queues; i++)
+	/* USB keeps a single URB pool, accounted in hw_tx_queue[0] only;
+	 * the other entries stay 0 and would stop the queue forever. */
+	int n = IS_USB(adev) ? 1 : adev->num_hw_tx_queues;
+
+	for (i=0; i<n; i++)
 	{
 		if (adev->hw_tx_queue[i].free < TX_STOP_QUEUE)
 		{
