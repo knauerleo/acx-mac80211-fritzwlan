@@ -872,10 +872,21 @@ static void acxusb_complete_rx(struct urb *urb)
 	log(L_USBRXTX, "acxusb: RETURN RX (%d) status=%d size=%d\n",
 		rxnum, urb->status, size);
 
-	/* Send the URB that's waiting. */
-	log(L_USBRXTX, "acxusb: rxnum=%d, sending=%d\n",
-		rxnum, rxnum ^ 1);
-	acxusb_poll_rx(adev, &adev->usb_rx[rxnum ^ 1]);
+	/* Send the URB that's waiting -- but not after a fatal error,
+	 * otherwise a persistent error turns into a resubmit livelock
+	 * in completion (BH) context. */
+	switch (urb->status) {
+	case 0:
+	case -EOVERFLOW:
+		log(L_USBRXTX, "acxusb: rxnum=%d, sending=%d\n",
+			rxnum, rxnum ^ 1);
+		acxusb_poll_rx(adev, &adev->usb_rx[rxnum ^ 1]);
+		break;
+	default:
+		printk_ratelimited(KERN_ERR "acxusb: rx urb status %d, rx stopped\n",
+				   urb->status);
+		break;
+	}
 
 	if (unlikely(size > sizeof(rxbuffer_t)))
 		log(L_USBRXTX, "acxusb: rx too large: %d, please report\n", size);
@@ -897,7 +908,6 @@ static void acxusb_complete_rx(struct urb *urb)
 	default:
 		adev->rxtruncsize = 0;
 		adev->stats.rx_errors++;
-		pr_acx("rx error (urb status=%d)\n", urb->status);
 		return;
 	}
 
@@ -995,8 +1005,19 @@ static void acxusb_complete_rx(struct urb *urb)
 					stat->ack_failures, stat->rts_failures,
 					stat->rts_ok);
 
-            tx = (usb_tx_t*) (adev->usb_tx + stat->hostdata);
-            skb = tx->skb;
+		if (unlikely(stat->hostdata >= ACX_TX_URB_CNT)) {
+			printk_ratelimited(KERN_WARNING "acxusb: bogus txstat hostdata %u\n",
+					   stat->hostdata);
+			goto next;
+		}
+		tx = adev->usb_tx + stat->hostdata;
+		skb = tx->skb;
+		if (unlikely(!tx->busy || !skb)) {
+			printk_ratelimited(KERN_WARNING "acxusb: txstat for idle buffer %u\n",
+					   stat->hostdata);
+			goto next;
+		}
+		tx->skb = NULL;
 		txstatus = IEEE80211_SKB_CB(skb);
 
             if (!(txstatus->flags & IEEE80211_TX_CTL_NO_ACK))

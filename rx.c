@@ -171,6 +171,9 @@ static void acx_rx(acx_device_t *adev, rxbuffer_t *rxbuf)
 			acx_plcp_get_bitrate_cck(rxbuf->phy_plcp_signal);
 #endif
 
+	adev->stats.rx_packets++;
+	adev->stats.rx_bytes += skb->len;
+
 	if (IS_PCI(adev)) {
 #if CONFIG_ACX_MAC80211_VERSION <= KERNEL_VERSION(2, 6, 32)
 		local_bh_disable();
@@ -185,9 +188,6 @@ static void acx_rx(acx_device_t *adev, rxbuffer_t *rxbuf)
 		ieee80211_rx_irqsafe(adev->hw, skb);
 	else
 		logf0(L_ANY, "ERROR: Undefined device type !?\n");
-
-	adev->stats.rx_packets++;
-	adev->stats.rx_bytes += skb->len;
 
 }
 
