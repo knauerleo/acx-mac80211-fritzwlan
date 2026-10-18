@@ -17,6 +17,8 @@
  */
 
 #include <linux/string.h>
+#include <linux/module.h>
+#include <linux/moduleparam.h>
 #include "acx_debug.h"
 
 #include "acx.h"
@@ -422,10 +424,39 @@ int acx1xx_set_tx_level(acx_device_t *adev, u8 level_val)
 	return acx1xx_update_tx_level(adev);
 }
 
+/*
+ * TNETW1450 (USB): the firmware boots at level 1 = full power. Sustained
+ * OFDM tx at that level stalls the firmware's tx within ~20 s (no more
+ * type-2 tx status, AP falls back to 1M towards us); level 3 lasts ~60 s,
+ * level 5 held (tools/pwr-*.txt). TI sets the level with IE 0x100d, 2 data
+ * bytes (whal_hwInfoElemTxPowerLevel). Cap it, on acx's 0..20 dBm scale
+ * with 4 dBm per level: 4 -> level 5, 12 -> level 3, 20 -> level 1.
+ */
+static int acx_txpower_max = 4;
+module_param_named(txpower_max, acx_txpower_max, int, 0644);
+MODULE_PARM_DESC(txpower_max, "TNETW1450: max tx power, dBm on acx's 0..20 scale "
+		 "(4 per level; default 4 = lowest level 5, 20 = full power)");
+
+static int acx1450_update_tx_level(acx_device_t *adev)
+{
+	int numl = TX_CFG_ACX111_NUM_POWER_LEVELS;
+	int dpl = TX_CFG_MAX_DBM_POWER / numl;
+	int nlr = clamp((acx_txpower_max + dpl / 2) / dpl, 1, numl);
+	u8 cap = numl - nlr + 1;
+	u8 level = max_t(u8, adev->tx_level_val, cap);	/* higher = weaker */
+	u8 buf[4 + 2] = { 0x0d, 0x10, 2, 0, level, 0 };
+
+	log(L_INIT, "Updating tx-power-level to: %d (requested %d, cap %d)\n",
+	    level, adev->tx_level_val, cap);
+	return acx_issue_cmd(adev, ACX1xx_CMD_CONFIGURE, buf, sizeof(buf));
+}
+
 int acx1xx_update_tx_level(acx_device_t *adev)
 {
 	struct acx1xx_ie_tx_level tx_level;
 
+	if (IS_USB(adev) && IS_ACX111(adev))
+		return acx1450_update_tx_level(adev);
 	if (IS_USB(adev)) {
 		logf0(L_ANY, "Update tx-level not yet supported on usb\n");
 		return OK;
