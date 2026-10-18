@@ -1265,6 +1265,28 @@ static void acxusb_complete_tx(struct urb *urb)
 		/* FIXME: real error-handling code here please */
 	}
 
+	/* TNETW1450 firmware 2.4.0.72 never sends tx status records, so
+	 * complete the frame once USB has handed it to the stick (like
+	 * rtl8187 without status reporting). A late txstat record for this
+	 * buffer is ignored by acxusb_handle_txstat(). */
+	if (IS_ACX111(adev) && tx->busy && tx->skb) {
+		struct sk_buff *skb = tx->skb;
+		struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+
+		tx->skb = NULL;
+		ieee80211_tx_info_clear_status(info);
+		if (urb->status == 0 && !(info->flags & IEEE80211_TX_CTL_NO_ACK))
+			info->flags |= IEEE80211_TX_STAT_ACK;
+		ieee80211_tx_status_irqsafe(adev->hw, skb);
+
+		tx->busy = 0;
+		adev->hw_tx_queue[0].free++;
+		if (adev->hw_tx_queue[0].free >= TX_START_QUEUE &&
+		    acx_queue_stopped(adev->hw)) {
+			acx_wake_queue(adev->hw, NULL);
+			ieee80211_queue_work(adev->hw, &adev->tx_work);
+		}
+	}
 }
 
 /*
