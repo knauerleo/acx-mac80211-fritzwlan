@@ -133,7 +133,10 @@ MODULE_DEVICE_TABLE(usb, acxusb_ids);
 
 /* The number of bulk URBs to use */
 #define ACX_TX_URB_CNT		8
-#define ACX_RX_URB_CNT		2
+/* rx: all urbs stay queued on the bulk-in endpoint and each one is
+ * resubmitted after its data was processed (acx used a ping-pong of 2,
+ * which left a single urb in flight) */
+#define ACX_RX_URB_CNT		8
 
 /* Should be sent to the bulkout endpoint */
 #define ACX_USB_REQ_UPLOAD_FW	0x10
@@ -1002,13 +1005,13 @@ static void acxusb_rx_tnetw1450(acx_device_t *adev, u8 *buf, int size)
 	}
 }
 
+static void acxusb_process_rx(acx_device_t *adev, usb_rx_t *rx, struct urb *urb);
+
 static void acxusb_complete_rx(struct urb *urb)
 {
 	acx_device_t *adev;
-	rxbuffer_t *ptr;
-	rxbuffer_t *inbuf;
 	usb_rx_t *rx;
-	int size, remsize, packetsize, rxnum;
+	int rxnum;
 	// unsigned long flags;
 
 
@@ -1032,29 +1035,39 @@ static void acxusb_complete_rx(struct urb *urb)
 		return;
 	}
 
-	inbuf = &rx->bulkin;
-	size = urb->actual_length;
-	remsize = size;
 	rxnum = rx - adev->usb_rx;
 
 	log(L_USBRXTX, "acxusb: RETURN RX (%d) status=%d size=%d\n",
-		rxnum, urb->status, size);
+		rxnum, urb->status, urb->actual_length);
 
-	/* Send the URB that's waiting -- but not after a fatal error,
-	 * otherwise a persistent error turns into a resubmit livelock
-	 * in completion (BH) context. */
+	acxusb_process_rx(adev, rx, urb);
+
+	/* Requeue this urb -- but not after a fatal error, otherwise a
+	 * persistent error turns into a resubmit livelock in completion
+	 * (BH) context.  The other urbs keep rx going meanwhile. */
 	switch (urb->status) {
 	case 0:
 	case -EOVERFLOW:
-		log(L_USBRXTX, "acxusb: rxnum=%d, sending=%d\n",
-			rxnum, rxnum ^ 1);
-		acxusb_poll_rx(adev, &adev->usb_rx[rxnum ^ 1]);
+		acxusb_poll_rx(adev, rx);
+		break;
+	case -ENOENT:
+	case -ECONNRESET:
+	case -ESHUTDOWN:
 		break;
 	default:
-		printk_ratelimited(KERN_ERR "acxusb: rx urb status %d, rx stopped\n",
-				   urb->status);
+		printk_ratelimited(KERN_ERR "acxusb: rx urb %d status %d, "
+				   "urb not requeued\n", rxnum, urb->status);
 		break;
 	}
+}
+
+static void acxusb_process_rx(acx_device_t *adev, usb_rx_t *rx, struct urb *urb)
+{
+	rxbuffer_t *ptr;
+	rxbuffer_t *inbuf = &rx->bulkin;
+	int size = urb->actual_length;
+	int remsize = size;
+	int packetsize, rxnum = rx - adev->usb_rx;
 
 	if (unlikely(size > sizeof(rxbuffer_t)))
 		log(L_USBRXTX, "acxusb: rx too large: %d, please report\n", size);
@@ -1703,7 +1716,8 @@ static int acxusb_op_start(struct ieee80211_hw *hw)
 	/* HW_UP first: complete_rx() drops (and doesn't resubmit) while down */
 	set_bit(ACX_FLAG_HW_UP, &adev->flags);
 
-	acxusb_poll_rx(adev, &adev->usb_rx[0]);
+	for (i = 0; i < ACX_RX_URB_CNT; i++)
+		acxusb_poll_rx(adev, &adev->usb_rx[i]);
 
 	acx_wake_queue(adev->hw, NULL);
 
