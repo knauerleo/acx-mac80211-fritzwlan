@@ -1363,7 +1363,8 @@ void *acxusb_get_txbuf(acx_device_t * adev, tx_t * tx_opaque)
  * Can be called from acx_i_start_xmit (data frames from net core).
  */
 /*
- * TNETW1450 bulk-out header, as built by fwlanusb.sys FUN_00043014:
+ * TNETW1450 bulk-out descriptor (sent AFTER the frame), as built by
+ * fwlanusb.sys FUN_00043014 / fwlanusb-lib.o usbTxDesc_FieldsInfoSet:
  *   0  le16 802.11 frame length (without this header)
  *   2  u8   hw queue
  *   3  u8   flags: 0x10 always, 0x20 RTS, 0x01/0x02 (unknown), 0x80 special
@@ -1399,35 +1400,47 @@ static void acxusb_1450_rate(u16 rate_100, u16 *mask, u8 *plcp)
 	*plcp = 0x0a;
 }
 
-/* Returns the number of bytes to send. */
+/*
+ * Returns the number of bytes to send.  Layout (fwlanusb-lib.o
+ * usbTx_SendOneMsdu appends the descriptor as the LAST buffer of the
+ * chain, MSDU2Buff copies the chain in order):
+ *   [802.11 frame][0x00 pad if (frame+16) % wMaxPacketSize == 0][16-byte desc]
+ */
 static int acxusb_1450_fill_txhdr(acx_device_t *adev, usb_txbuffer_t *txbuf,
 				  int wlanpkt_len, u16 rate_100)
 {
 	static u8 seq;
-	u8 *hdr = (u8 *)txbuf;
-	u8 *frame = hdr + ACXUSB_1450_TXHDRLEN;
+	u8 *buf = (u8 *)txbuf;
+	u8 *desc;
+	int mps = usb_maxpacket(adev->usbdev,
+				usb_sndbulkpipe(adev->usbdev, adev->bulkoutep));
+	int len;
 	u16 mask;
 	u8 plcp;
 
-	if (wlanpkt_len + 2 > sizeof(txbuf->data))
+	if (wlanpkt_len + 1 + ACXUSB_1450_TXHDRLEN > sizeof(*txbuf))
 		return -EMSGSIZE;
 
 	/* frame was copied right after the 14-byte classic header */
-	memmove(frame, txbuf->data, wlanpkt_len);
+	memmove(buf, txbuf->data, wlanpkt_len);
+	len = wlanpkt_len;
+	if (mps && (len + ACXUSB_1450_TXHDRLEN) % mps == 0)
+		buf[len++] = 0;
+	desc = buf + len;
 
 	acxusb_1450_rate(rate_100, &mask, &plcp);
-	put_unaligned_le16(wlanpkt_len, hdr + 0);
-	hdr[2] = 0;
-	hdr[3] = 0x10;
-	put_unaligned_le32(0, hdr + 4);
-	put_unaligned_le16(mask, hdr + 8);
-	hdr[10] = 0;
-	hdr[11] = plcp;
-	memcpy(hdr + 12, frame, 2);	/* frame control */
-	hdr[14] = seq++;
-	hdr[15] = 0;
+	put_unaligned_le16(wlanpkt_len, desc + 0);
+	desc[2] = 0;
+	desc[3] = 0x10;
+	put_unaligned_le32(0, desc + 4);
+	put_unaligned_le16(mask, desc + 8);
+	desc[10] = 0;
+	desc[11] = plcp;
+	memcpy(desc + 12, buf, 2);	/* frame control */
+	desc[14] = seq++;
+	desc[15] = 0;
 
-	return wlanpkt_len + ACXUSB_1450_TXHDRLEN;
+	return len + ACXUSB_1450_TXHDRLEN;
 }
 
 void acxusb_tx_data(acx_device_t *adev, tx_t *tx_opaque, int wlanpkt_len,
