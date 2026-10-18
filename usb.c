@@ -917,7 +917,7 @@ static void acxusb_rx_tnetw1450(acx_device_t *adev, u8 *buf, int size)
 		if (total < 4 || total > size - off) {
 			printk_ratelimited(KERN_WARNING "acxusb: bad rx record at %d/%d "
 					   "(word 0x%04x)\n", off, size, w);
-			if (net_ratelimit())
+			if ((acx_debug & L_USBRXTX) && net_ratelimit())
 				print_hex_dump(KERN_WARNING, "acxusb rec: ", DUMP_PREFIX_OFFSET,
 					       16, 1, rec, min(size - off, 64), false);
 			return;
@@ -948,7 +948,8 @@ static void acxusb_rx_tnetw1450(acx_device_t *adev, u8 *buf, int size)
 					       16, 1, rec, total, false);
 			break;
 		default:
-			if (net_ratelimit()) {
+			/* info blocks and command responses: not used yet */
+			if ((acx_debug & L_USBRXTX) && net_ratelimit()) {
 				pr_info("acxusb: rx record type %d, %d bytes\n", type, total);
 				print_hex_dump(KERN_INFO, "acxusb rec: ", DUMP_PREFIX_OFFSET,
 					       16, 1, rec, min(total, 64), false);
@@ -1261,13 +1262,12 @@ static void acxusb_complete_tx(struct urb *urb)
 	 * to play with them. The urb may get unlinked.
 	 */
 	if (unlikely(!test_bit(ACX_FLAG_HW_UP, &adev->flags))) {
-		pr_acx("tx: device is down, not doing anything\n");
+		log(L_USBRXTX, "tx: device is down, not doing anything\n");
 		return;
 	}
 
-	if (net_ratelimit())
-		pr_info("acxusb: tx urb done: status=%d actual=%d\n",
-			urb->status, urb->actual_length);
+	log(L_USBRXTX, "acxusb: tx urb done: status=%d actual=%d\n",
+	    urb->status, urb->actual_length);
 
 	/* handle USB transfer errors */
 	switch (urb->status) {
@@ -1518,7 +1518,7 @@ void acxusb_tx_data(acx_device_t *adev, tx_t *tx_opaque, int wlanpkt_len,
 	    );
 
 	txurb->transfer_flags = URB_ASYNC_UNLINK | URB_ZERO_PACKET;
-	if (net_ratelimit()) {
+	if ((acx_debug & L_DATA) && net_ratelimit()) {
 		pr_info("acxusb: tx urb %d: %d bytes\n", txnum, txsize);
 		print_hex_dump(KERN_INFO, "acxusb tx: ", DUMP_PREFIX_OFFSET, 16, 1,
 			       txbuf, min(txsize, 48), false);

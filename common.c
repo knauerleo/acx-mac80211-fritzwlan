@@ -163,13 +163,13 @@ MODULE_PARM_DESC(debug, "Debug level mask (see L_xxx constants)");
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 36)
 /* implement /sys/module/acx_mac80211/parameters/debugflags */
 
+/* indexed by bit number, must match enum debug_flags */
 static const char *flag_names[] = {
-	"L_LOCK", "L_INIT", "L_IRQ", "L_ASSOC", "undef", "L_XFER",
-	"L_DATA", "L_DEBUG", "L_IOCTL", "L_CTL", "L_BUFR", "undef",
-	"L_BUFT", "L_USBRXTX", "L_BUF",
+	"L_LOCK", "L_INIT", "L_IRQ", "L_ASSOC", "undef", "undef",
+	"undef", "L_XFER", "L_DATA", "L_DEBUG", "L_IOCTL", "L_CTL",
+	"L_BUFR", "undef", "L_BUFT", "L_USBRXTX",
 };
-/* should check enum debug_flags, but no suitable val is set */
-BUILD_BUG_DECL(flag_names, ARRAY_SIZE(flag_names) != 15);
+BUILD_BUG_DECL(flag_names, ARRAY_SIZE(flag_names) != 16);
 
 static int acx_debug_flag_get(char *buf, const struct kernel_param *kp)
 {
