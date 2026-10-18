@@ -905,44 +905,55 @@ static void acxusb_rx_tnetw1450(acx_device_t *adev, u8 *buf, int size)
 {
 	int off = 0;
 
-	if (size < ACXUSB_1450_HDRLEN + RXBUF_HDRSIZE) {
-		/* short firmware record (seen: 24 bytes), purpose unknown yet */
-		pr_info("acxusb: short rx record, %d bytes\n", size);
-		print_hex_dump(KERN_INFO, "acxusb short: ", DUMP_PREFIX_OFFSET,
-			       16, 1, buf, size, false);
-	}
-
-	while (size - off >= ACXUSB_1450_HDRLEN + RXBUF_HDRSIZE) {
+	/* record = le16 (type << 14 | total_len) ...; types per fwlanusb.sys
+	 * FUN_00042a70: 0 rx frame (20-byte hdr + rxbuffer_t), 1 info (100 bytes),
+	 * 2 tx status (24 bytes), 3 command response (<= 0x414) */
+	while (size - off >= 4) {
 		u8 *rec = buf + off;
-		int total = get_unaligned_le16(rec);
-		int plen = get_unaligned_le16(rec + 4);
-		rxbuffer_t *rxbuf = (rxbuffer_t *)(rec + ACXUSB_1450_HDRLEN);
+		u16 w = get_unaligned_le16(rec);
+		int type = w >> 14;
+		int total = w & 0x3fff;
 
-		if (total < ACXUSB_1450_HDRLEN + RXBUF_HDRSIZE ||
-		    total > size - off ||
-		    plen != total - ACXUSB_1450_HDRLEN) {
-			printk_ratelimited(KERN_WARNING "acxusb: unknown rx record at %d/%d "
-					   "(total %d, plen %d)\n", off, size, total, plen);
+		if (total < 4 || total > size - off) {
+			printk_ratelimited(KERN_WARNING "acxusb: bad rx record at %d/%d "
+					   "(word 0x%04x)\n", off, size, w);
 			if (net_ratelimit())
 				print_hex_dump(KERN_WARNING, "acxusb rec: ", DUMP_PREFIX_OFFSET,
 					       16, 1, rec, min(size - off, 64), false);
 			return;
 		}
 
-		if (RXBUF_IS_TXSTAT(rxbuf)) {
-			if (net_ratelimit())
+		switch (type) {
+		case 0: {
+			int plen = total >= 6 ? get_unaligned_le16(rec + 4) : -1;
+			rxbuffer_t *rxbuf = (rxbuffer_t *)(rec + ACXUSB_1450_HDRLEN);
+
+			if (total < ACXUSB_1450_HDRLEN + RXBUF_HDRSIZE ||
+			    plen != total - ACXUSB_1450_HDRLEN) {
+				printk_ratelimited(KERN_WARNING "acxusb: odd rx frame record "
+						   "(total %d, plen %d)\n", total, plen);
+			} else if (RXBUF_BYTES_USED(rxbuf) > plen) {
+				printk_ratelimited(KERN_WARNING "acxusb: rx frame len %d exceeds "
+						   "record %d\n", RXBUF_BYTES_USED(rxbuf), plen);
+			} else {
+				acx_process_rxbuf(adev, rxbuf);
+			}
+			break;
+		}
+		case 2:
+			/* tx status: byte 0x16 = hw queue; completion is reported
+			 * on urb completion already (see acxusb_complete_tx) */
+			if (acx_debug & L_USBRXTX)
 				print_hex_dump(KERN_INFO, "acxusb txstat: ", DUMP_PREFIX_OFFSET,
-					       16, 1, rec, min(total, 48), false);
-			acxusb_handle_txstat(adev, (usb_txstatus_t *)rxbuf);
-		} else if ((le16_to_cpu(rxbuf->mac_cnt_rcvd) & 0xfff) == 0) {
-			if (net_ratelimit())
-				print_hex_dump(KERN_INFO, "acxusb rec0: ", DUMP_PREFIX_OFFSET,
+					       16, 1, rec, total, false);
+			break;
+		default:
+			if (net_ratelimit()) {
+				pr_info("acxusb: rx record type %d, %d bytes\n", type, total);
+				print_hex_dump(KERN_INFO, "acxusb rec: ", DUMP_PREFIX_OFFSET,
 					       16, 1, rec, min(total, 64), false);
-		} else if (RXBUF_BYTES_USED(rxbuf) > plen) {
-			printk_ratelimited(KERN_WARNING "acxusb: rx frame len %d exceeds "
-					   "record %d\n", RXBUF_BYTES_USED(rxbuf), plen);
-		} else {
-			acx_process_rxbuf(adev, rxbuf);
+			}
+			break;
 		}
 
 		off += total;
