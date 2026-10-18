@@ -106,6 +106,7 @@ static int acx_tx_frame(acx_device_t *adev, struct sk_buff *skb)
 	void *txbuf;
 	struct ieee80211_tx_info *ctl;
 	struct ieee80211_hdr *hdr;
+	unsigned int len = skb->len;
 
 	/* Default queue_id for data-frames */
 	int queue_id=1;
@@ -124,7 +125,14 @@ static int acx_tx_frame(acx_device_t *adev, struct sk_buff *skb)
 	if (!adev->hw_encrypt_enabled)
 		queue_id=NOENC_QUEUE_ID;
 
-	tx = acx_alloc_tx(adev, skb->len, queue_id);
+	/* USB: the frame must fit the urb buffer, see ACXUSB_MAX_TX_FRAME */
+	if (IS_USB(adev) && len > ACXUSB_MAX_TX_FRAME) {
+		pr_err_ratelimited("acx: tx frame too long (%u), dropped\n", len);
+		ieee80211_free_txskb(adev->hw, skb);
+		return 0;
+	}
+
+	tx = acx_alloc_tx(adev, len, queue_id);
 
 	if (unlikely(!tx)) {
 		logf0(L_BUFT, "No tx available\n");
@@ -146,12 +154,13 @@ static int acx_tx_frame(acx_device_t *adev, struct sk_buff *skb)
 	/* FIXME: Is this required for mem ? txbuf is actually not containing to the data
 	 * for the device, but actually "addr = acxmem_allocate_acx_txbuf_space in acxmem_tx_data().
 	 */
-	memcpy(txbuf, skb->data, skb->len);
+	memcpy(txbuf, skb->data, len);
 
-	acx_tx_data(adev, tx, skb->len, ctl, skb, queue_id);
+	/* USB may complete and free the skb before this returns */
+	acx_tx_data(adev, tx, len, ctl, skb, queue_id);
 
 	adev->stats.tx_packets++;
-	adev->stats.tx_bytes += skb->len;
+	adev->stats.tx_bytes += len;
 
 	return 0;
 }
@@ -166,10 +175,9 @@ void acx_tx_queue_flush(acx_device_t *adev)
 
 		logf1(L_BUF, "Flushing skb 0x%p", skb);
 
-		if (!(info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS))
-			continue;
-
-		ieee80211_tx_status_skb(adev->hw, skb);
+		/* frees it; reports a failure if a status was requested
+		 * (the old code leaked every skb without REQ_TX_STATUS) */
+		ieee80211_free_txskb(adev->hw, skb);
 	}
 }
 
@@ -503,6 +511,11 @@ void acx_tx_queue_go(acx_device_t *adev)
 			logf0(L_BUFT, "EBUSY: Stop queue. Requeuing skb.\n");
 			acx_stop_queue(adev->hw, NULL);
 			skb_queue_head(&adev->tx_queue, skb);
+			/* a tx credit or urb freed between the failed alloc and
+			 * the stop would have found the queue running and not
+			 * woken it */
+			if (IS_USB(adev))
+				acxusb_txst_kick(adev);
 			goto out;
 		} else if (ret < 0) {
 			logf0(L_BUF, "Other ERR: (Card was removed ?!):"
@@ -518,6 +531,8 @@ void acx_tx_queue_go(acx_device_t *adev)
 		if (acx_is_hw_tx_queue_stop_limit(adev))
 		{
 			acx_stop_queue(adev->hw, NULL);
+			if (IS_USB(adev))
+				acxusb_txst_kick(adev);
 			goto out;
 		}
 	}

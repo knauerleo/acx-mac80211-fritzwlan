@@ -49,6 +49,13 @@ tx_t *acxusb_alloc_tx(acx_device_t *adev);
 void acxusb_dealloc_tx(tx_t * tx_opaque);
 void *acxusb_get_txbuf(acx_device_t * adev, tx_t * tx_opaque);
 void acxusb_tx_data(acx_device_t *adev, tx_t *tx_opaque, int wlanpkt_len, struct ieee80211_tx_info *ieeectl, struct sk_buff *skb);
+void acxusb_txst_kick(acx_device_t *adev);
+
+/* Largest 802.11 frame a tx urb buffer takes: the frame is copied into
+ * usb_txbuffer_t.data, and the TNETW1450 layout moves it to the start of the
+ * buffer and appends a pad byte and the 16-byte descriptor. Software
+ * CCMP/TKIP (no hw crypto on the 1450) puts IV and MIC into the skb. */
+#define ACXUSB_MAX_TX_FRAME	(sizeof(usb_txbuffer_t) - 1 - 16)
 
 /* Irq Handling, Timer */
 void acxusb_irq_work(struct work_struct *work);
@@ -94,6 +101,9 @@ static inline tx_t *acxusb_alloc_tx(acx_device_t *adev)
 }
 
 static inline void acxusb_dealloc_tx(tx_t * tx_opaque)
+{}
+
+static inline void acxusb_txst_kick(acx_device_t *adev)
 {}
 
 static inline void *acxusb_get_txbuf(acx_device_t * adev, tx_t * tx_opaque)

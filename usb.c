@@ -139,6 +139,8 @@ MODULE_DEVICE_TABLE(usb, acxusb_ids);
  * resubmitted after its data was processed (acx used a ping-pong of 2,
  * which left a single urb in flight) */
 #define ACX_RX_URB_CNT		8
+/* consecutive rx urb errors that are still requeued (acxusb_complete_rx) */
+#define ACXUSB_RX_ERR_BUDGET	32
 
 /* Should be sent to the bulkout endpoint */
 #define ACX_USB_REQ_UPLOAD_FW	0x10
@@ -363,6 +365,11 @@ acxusb_boot(struct usb_device *usbdev, int is_tnetw1450, int *radio_type)
 		 * takes an even number of bulk *packets* (wMaxPacketSize),
 		 * not 2048-byte transfers. For FwUSB1b.bin (97352 bytes) the
 		 * two rules disagree (191 packets: no pad; 48 blocks: pad). */
+		if (!usb_maxpacket(usbdev, outpipe)) {
+			pr_err("acxusb: no usable bulk-out endpoint 1\n");
+			result = -ENODEV;
+			goto end;
+		}
 		need_padding =
 		    acxusb_fw_needs_padding(fw_image, usb_maxpacket(usbdev, outpipe));
 		pr_info("acxusb: firmware padding %d (wMaxPacketSize %d)\n",
@@ -603,7 +610,9 @@ acxusb_issue_cmd_timeo_debug(acx_device_t * adev,
 	 * fw 2.4.0.72 returns a bigger FIRMWARE_STATISTICS -> -EOVERFLOW),
 	 * so read into a buffer of at least ACXUSB_CMD_RESP_MAX bytes */
 	#define ACXUSB_CMD_RESP_MAX 1024
-	loc = kmalloc(max_t(unsigned, buflen, ACXUSB_CMD_RESP_MAX) + 4 +
+	/* zeroed: a short answer must not hand stale heap to the caller
+	 * (debugfs 'ie' dumps interrogate results to userspace) */
+	loc = kzalloc(max_t(unsigned, buflen, ACXUSB_CMD_RESP_MAX) + 4 +
 		      BOGUS_SAFETY_PADDING, GFP_KERNEL);
 	if (!loc) {
 		pr_acx("%s: no memory for data buffer\n", devname);
@@ -924,8 +933,9 @@ static bool acxusb_txst_full(acx_device_t *adev)
 	       skb_queue_len(&adev->txst_q) >= clamp(acx_txcredits, 1U, 16U);
 }
 
-/* a frame left txst_q: restart tx if only the credits held it back */
-static void acxusb_txst_kick(acx_device_t *adev)
+/* a frame left txst_q or an urb is free again: restart tx if the queue was
+ * stopped and both a credit and urb buffers are available */
+void acxusb_txst_kick(acx_device_t *adev)
 {
 	if (acx_queue_stopped(adev->hw) && !acxusb_txst_full(adev) &&
 	    adev->hw_tx_queue[0].free >= TX_START_QUEUE &&
@@ -1039,10 +1049,15 @@ static void acxusb_txst_record(acx_device_t *adev, const u8 *rec)
 
 	spin_lock_irqsave(&q->lock, flags);
 	skb_queue_walk(q, skb) {
-		if (acxusb_txst_stamp(skb)[1] == rec[2]) {
+		if (acxusb_txst_stamp(skb)[1] != rec[2])
+			continue;
+		/* a firmware-own frame (probe request) could carry a seq
+		 * byte equal to a waiting host frame's: frame control too */
+		if (get_unaligned_le16(skb->data) == fc)
 			found = skb;
-			break;
-		}
+		else
+			adev->txst_cnt.fcmismatch++;
+		break;
 	}
 	if (!found) {
 		adev->txst_cnt.orphan++;
@@ -1055,8 +1070,6 @@ static void acxusb_txst_record(acx_device_t *adev, const u8 *rec)
 		adev->txst_cnt.matched++;
 		if (rec[0x12] == 0)
 			adev->txst_cnt.acked++;
-		if (get_unaligned_le16(found->data) != fc)
-			adev->txst_cnt.fcmismatch++;
 		adev->txst_cnt.latsum += jiffies - acxusb_txst_stamp(found)[0];
 		acxusb_txst_report(adev, found, rec, false);
 	}
@@ -1231,21 +1244,36 @@ static void acxusb_complete_rx(struct urb *urb)
 
 	acxusb_process_rx(adev, rx, urb);
 
-	/* Requeue this urb -- but not after a fatal error, otherwise a
-	 * persistent error turns into a resubmit livelock in completion
-	 * (BH) context.  The other urbs keep rx going meanwhile. */
+	/* Requeue this urb. Transient errors (-EPROTO, -EILSEQ, -ETIME on a
+	 * flaky hub) are requeued too, but only up to a budget of
+	 * consecutive errors: a persistent error would otherwise be a
+	 * resubmit livelock in completion (BH) context. Unlink/disconnect
+	 * and a stalled endpoint (never clear_halt the bulk eps, see
+	 * TNETW1450-USB.md) are not requeued. */
 	switch (urb->status) {
 	case 0:
+		adev->rx_urb_errs = 0;
+		fallthrough;
 	case -EOVERFLOW:
 		acxusb_poll_rx(adev, rx);
 		break;
 	case -ENOENT:
 	case -ECONNRESET:
 	case -ESHUTDOWN:
+	case -ENODEV:
+		break;
+	case -EPIPE:
+		printk_ratelimited(KERN_ERR "acxusb: rx urb %d stalled, "
+				   "not requeued\n", rxnum);
 		break;
 	default:
-		printk_ratelimited(KERN_ERR "acxusb: rx urb %d status %d, "
-				   "urb not requeued\n", rxnum, urb->status);
+		if (++adev->rx_urb_errs <= ACXUSB_RX_ERR_BUDGET) {
+			acxusb_poll_rx(adev, rx);
+			break;
+		}
+		printk_ratelimited(KERN_ERR "acxusb: rx urb %d status %d after %d "
+				   "errors in a row, urb not requeued\n", rxnum,
+				   urb->status, adev->rx_urb_errs);
 		break;
 	}
 }
@@ -1553,10 +1581,11 @@ static void acxusb_complete_tx(struct urb *urb)
 			ieee80211_tx_status_irqsafe(adev->hw, skb);
 		}
 		tx->txst = 0;
-		spin_unlock_irqrestore(&adev->txst_q.lock, flags);
-
+		/* slot accounting under the same lock as acxusb_alloc_tx */
 		tx->busy = 0;
 		adev->hw_tx_queue[0].free++;
+		spin_unlock_irqrestore(&adev->txst_q.lock, flags);
+
 		acxusb_txst_kick(adev);
 	}
 }
@@ -1569,12 +1598,15 @@ tx_t *acxusb_alloc_tx(acx_device_t *adev)
 {
 	usb_tx_t *tx;
 	unsigned head;
+	unsigned long flags;
 
-
+	/* busy/free are also changed in urb completion (BH): one lock */
+	spin_lock_irqsave(&adev->txst_q.lock, flags);
 
 	if (acxusb_txst_full(adev)) {
 		log(L_BUFT, "acx: no tx credit (%u frames without status)\n",
 		    skb_queue_len(&adev->txst_q));
+		spin_unlock_irqrestore(&adev->txst_q.lock, flags);
 		return NULL;
 	}
 
@@ -1595,6 +1627,7 @@ tx_t *acxusb_alloc_tx(acx_device_t *adev)
 
 	end:
 	adev->hw_tx_queue[0].head = head;
+	spin_unlock_irqrestore(&adev->txst_q.lock, flags);
 
 	return (tx_t *) tx;
 }
@@ -1605,7 +1638,13 @@ tx_t *acxusb_alloc_tx(acx_device_t *adev)
 void acxusb_dealloc_tx(tx_t * tx_opaque)
 {
 	usb_tx_t *tx = (usb_tx_t *) tx_opaque;
+	acx_device_t *adev = tx->adev;
+	unsigned long flags;
+
+	spin_lock_irqsave(&adev->txst_q.lock, flags);
 	tx->busy = 0;
+	adev->hw_tx_queue[0].free++;	/* acxusb_alloc_tx took it */
+	spin_unlock_irqrestore(&adev->txst_q.lock, flags);
 }
 
 void *acxusb_get_txbuf(acx_device_t * adev, tx_t * tx_opaque)
@@ -1761,9 +1800,16 @@ void acxusb_tx_data(acx_device_t *adev, tx_t *tx_opaque, int wlanpkt_len,
 	if (IS_ACX111(adev)) {
 		txsize = acxusb_1450_fill_txhdr(adev, txbuf, wlanpkt_len, rate_100);
 		if (txsize < 0) {
+			/* not reached: acx_tx_frame checks ACXUSB_MAX_TX_FRAME */
+			unsigned long flags;
+
 			pr_err("acxusb: tx frame too long (%d)\n", wlanpkt_len);
+			spin_lock_irqsave(&adev->txst_q.lock, flags);
+			tx->skb = NULL;
 			tx->busy = 0;
 			adev->hw_tx_queue[0].free++;
+			spin_unlock_irqrestore(&adev->txst_q.lock, flags);
+			ieee80211_free_txskb(adev->hw, skb);
 			return;
 		}
 	}
@@ -1825,11 +1871,14 @@ void acxusb_tx_data(acx_device_t *adev, tx_t *tx_opaque, int wlanpkt_len,
 				__skb_unlink(skb, &adev->txst_q);
 			tx->txst = 0;
 			tx->skb = NULL;
+			tx->busy = 0;
+			adev->hw_tx_queue[0].free++;
 			spin_unlock_irqrestore(&adev->txst_q.lock, flags);
 			ieee80211_free_txskb(adev->hw, skb);
+		} else {
+			tx->busy = 0;
+			adev->hw_tx_queue[0].free++;
 		}
-		tx->busy = 0;
-		adev->hw_tx_queue[0].free++;
 		/* needed? if (adev->tx_free > TX_START_QUEUE) acx_wake_queue(...) */
 	}
 

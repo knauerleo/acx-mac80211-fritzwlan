@@ -552,6 +552,7 @@ struct acx_device {
 	int		bulkinep;	/* bulk-in endpoint */
 	int		bulkoutep;	/* bulk-out endpoint */
 	int		rxtruncsize;
+	int		rx_urb_errs;	/* consecutive rx urb errors */
 
 	/* TNETW1450 type-2 tx status: sent skbs wait here, in submit order */
 	struct sk_buff_head	txst_q;
