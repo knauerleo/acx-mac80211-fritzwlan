@@ -49,6 +49,8 @@
 #include <linux/ethtool.h>
 #include <linux/workqueue.h>
 #include <linux/nl80211.h>
+#include <linux/debugfs.h>
+#include <linux/timer.h>
 
 #include <net/iw_handler.h>
 #include <net/mac80211.h>
@@ -887,6 +889,182 @@ static void dump_device_descriptor(struct usb_device_descriptor *dd)
  * USB receive is triggered.
  */
 static void acxusb_poll_rx(acx_device_t * adev, usb_rx_t * rx);
+
+/*
+ * TNETW1450 tx status (type-2 records, TNETW1450-USB.md). With txstat=1 a
+ * sent skb waits in adev->txst_q (submit order) until its status record
+ * arrives, so minstrel gets the real ACK flag, retry count and rate. The
+ * records carry no host cookie, but byte 2 echoes the tx descriptor's
+ * sequence byte 14, so they are matched by that; waiting skbs in front of
+ * the match lost their record. A record matching no waiting skb is one of
+ * the firmware's own frames (probe requests, fc 0x0040) or came after its
+ * skb timed out. skbs without a record are completed after ACXUSB_TXST_TIMEOUT
+ * the old way (ACK assumed, no rate info).
+ *
+ * The records are also tx credits: TI's usbTx_CheckSize refuses to send
+ * while more than 7 frames of a hw queue have no status yet (sent +0x2c
+ * minus completed +0x30, completed++ in usbTx_Clean per record). Without
+ * that limit the firmware stops transmitting under load, silently.
+ */
+static unsigned int acx_txstat = 1;
+module_param_named(txstat, acx_txstat, uint, 0644);
+MODULE_PARM_DESC(txstat, "TNETW1450: complete tx frames from firmware tx status records (1) "
+		 "or on urb completion (0)");
+
+#define ACXUSB_TXST_TIMEOUT	(HZ / 2)
+#define ACXUSB_TXST_QMAX	64
+static unsigned int acx_txcredits = 8;
+module_param_named(txcredits, acx_txcredits, uint, 0644);
+MODULE_PARM_DESC(txcredits, "TNETW1450 with txstat: max frames without tx status (TI: 8; 1..16, "
+		 "without a limit the firmware loses and delays status records)");
+
+static bool acxusb_txst_full(acx_device_t *adev)
+{
+	return IS_ACX111(adev) && acx_txstat &&
+	       skb_queue_len(&adev->txst_q) >= clamp(acx_txcredits, 1U, 16U);
+}
+
+/* a frame left txst_q: restart tx if only the credits held it back */
+static void acxusb_txst_kick(acx_device_t *adev)
+{
+	if (acx_queue_stopped(adev->hw) && !acxusb_txst_full(adev) &&
+	    adev->hw_tx_queue[0].free >= TX_START_QUEUE &&
+	    test_bit(ACX_FLAG_HW_UP, &adev->flags)) {
+		acx_wake_queue(adev->hw, NULL);
+		ieee80211_queue_work(adev->hw, &adev->tx_work);
+	}
+}
+
+/* [0] submit jiffies, [1] tx descriptor sequence byte; the control part
+ * of the cb is no longer needed once submitted */
+static inline unsigned long *acxusb_txst_stamp(struct sk_buff *skb)
+{
+	return (unsigned long *)IEEE80211_SKB_CB(skb)->status.status_driver_data;
+}
+
+/* Called with txst_q.lock held, skb already off the queue. rec == NULL:
+ * no status record; ACK assumed unless the urb failed. */
+static void acxusb_txst_report(acx_device_t *adev, struct sk_buff *skb,
+			       const u8 *rec, bool failed)
+{
+	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+	int i;
+
+	for (i = 0; i < ACX_TX_URB_CNT; i++)
+		if (adev->usb_tx[i].skb == skb)
+			adev->usb_tx[i].skb = NULL;
+
+	ieee80211_tx_info_clear_status(info);
+	if (rec) {
+		u16 mask = get_unaligned_le16(rec + 10);
+		u8 plcp = rec[0x17];
+		/* 0x0a is 1M CCK or 12M OFDM: the rate mask tells */
+		int ofdm = plcp == 0x0a ? (mask & RATE111_12) && !(mask & RATE111_1) :
+			   acx111_plcp_to_rate_idx(plcp, 0) < 0;
+		int idx = acx111_plcp_to_rate_idx(plcp, ofdm);
+
+		if (idx >= 0)
+			info->status.rates[0].idx = idx;
+		info->status.rates[0].count = rec[0x13] + 1;
+		info->status.rates[1].idx = -1;
+		if (rec[0x12] == 0 && !(info->flags & IEEE80211_TX_CTL_NO_ACK))
+			info->flags |= IEEE80211_TX_STAT_ACK;
+	} else if (!failed && !(info->flags & IEEE80211_TX_CTL_NO_ACK)) {
+		info->flags |= IEEE80211_TX_STAT_ACK;
+	}
+	ieee80211_tx_status_irqsafe(adev->hw, skb);
+}
+
+static void acxusb_txst_expire(acx_device_t *adev)
+{
+	struct sk_buff_head *q = &adev->txst_q;
+	struct sk_buff *skb;
+	unsigned long flags;
+
+	spin_lock_irqsave(&q->lock, flags);
+	while ((skb = skb_peek(q)) &&
+	       (time_after(jiffies, *acxusb_txst_stamp(skb) + ACXUSB_TXST_TIMEOUT) ||
+		skb_queue_len(q) > ACXUSB_TXST_QMAX)) {
+		__skb_unlink(skb, q);
+		adev->txst_cnt.timeout++;
+		acxusb_txst_report(adev, skb, NULL, false);
+	}
+	if (skb)
+		mod_timer(&adev->txst_timer,
+			  *acxusb_txst_stamp(skb) + ACXUSB_TXST_TIMEOUT + 1);
+	spin_unlock_irqrestore(&q->lock, flags);
+	acxusb_txst_kick(adev);
+}
+
+static void acxusb_txst_timer(struct timer_list *t)
+{
+	acx_device_t *adev = timer_container_of(adev, t, txst_timer);
+
+	acxusb_txst_expire(adev);
+}
+
+/* ifdown: drop everything still waiting (urbs are already killed) */
+static void acxusb_txst_purge(acx_device_t *adev)
+{
+	struct sk_buff *skb;
+	unsigned long flags;
+	int i;
+
+	timer_delete_sync(&adev->txst_timer);
+	spin_lock_irqsave(&adev->txst_q.lock, flags);
+	while ((skb = __skb_dequeue(&adev->txst_q))) {
+		for (i = 0; i < ACX_TX_URB_CNT; i++)
+			if (adev->usb_tx[i].skb == skb)
+				adev->usb_tx[i].skb = NULL;
+		ieee80211_free_txskb(adev->hw, skb);
+	}
+	for (i = 0; i < ACX_TX_URB_CNT; i++)
+		adev->usb_tx[i].txst = 0;
+	spin_unlock_irqrestore(&adev->txst_q.lock, flags);
+}
+
+static void acxusb_txst_record(acx_device_t *adev, const u8 *rec)
+{
+	struct sk_buff_head *q = &adev->txst_q;
+	struct sk_buff *skb, *found = NULL;
+	u16 fc = get_unaligned_le16(rec + 8);
+	unsigned long flags;
+
+	if (acx_debug & L_TXSTAT)
+		pr_info("acx txst: seq %02x fc %04x mask %04x st %02x try %u q %u "
+			"plcp %02x qlen %u\n", rec[2], fc, get_unaligned_le16(rec + 10),
+			rec[0x12], rec[0x13], rec[0x16], rec[0x17], skb_queue_len(q));
+	if (!acx_txstat)
+		return;
+
+	spin_lock_irqsave(&q->lock, flags);
+	skb_queue_walk(q, skb) {
+		if (acxusb_txst_stamp(skb)[1] == rec[2]) {
+			found = skb;
+			break;
+		}
+	}
+	if (!found) {
+		adev->txst_cnt.orphan++;
+	} else {
+		/* earlier skbs got no record of their own */
+		while ((skb = __skb_dequeue(q)) != found) {
+			adev->txst_cnt.skipped++;
+			acxusb_txst_report(adev, skb, NULL, false);
+		}
+		adev->txst_cnt.matched++;
+		if (rec[0x12] == 0)
+			adev->txst_cnt.acked++;
+		if (get_unaligned_le16(found->data) != fc)
+			adev->txst_cnt.fcmismatch++;
+		adev->txst_cnt.latsum += jiffies - acxusb_txst_stamp(found)[0];
+		acxusb_txst_report(adev, found, rec, false);
+	}
+	spin_unlock_irqrestore(&q->lock, flags);
+	if (found)
+		acxusb_txst_kick(adev);
+}
+
 /* Report a tx status record (USB: rx record with bit 15 of mac_cnt_rcvd set) */
 static void acxusb_handle_txstat(acx_device_t *adev, usb_txstatus_t *stat)
 {
@@ -996,11 +1174,11 @@ static void acxusb_rx_tnetw1450(acx_device_t *adev, u8 *buf, int size)
 			break;
 		}
 		case 2:
-			/* tx status: byte 0x16 = hw queue; completion is reported
-			 * on urb completion already (see acxusb_complete_tx) */
 			if (acx_debug & L_USBRXTX)
 				print_hex_dump(KERN_INFO, "acxusb txstat: ", DUMP_PREFIX_OFFSET,
 					       16, 1, rec, total, false);
+			if (IS_ACX111(adev) && total == 24)
+				acxusb_txst_record(adev, rec);
 			break;
 		default:
 			/* info blocks and command responses: not used yet */
@@ -1350,27 +1528,36 @@ static void acxusb_complete_tx(struct urb *urb)
 		/* FIXME: real error-handling code here please */
 	}
 
-	/* TNETW1450 firmware 2.4.0.72 never sends tx status records, so
-	 * complete the frame once USB has handed it to the stick (like
-	 * rtl8187 without status reporting). A late txstat record for this
-	 * buffer is ignored by acxusb_handle_txstat(). */
-	if (IS_ACX111(adev) && tx->busy && tx->skb) {
-		struct sk_buff *skb = tx->skb;
-		struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+	/* TNETW1450: the urb buffer is free again. With txstat the skb
+	 * waits in txst_q for its type-2 status record (failed urbs are
+	 * completed here); without it, complete the frame now, like rtl8187
+	 * without status reporting. */
+	if (IS_ACX111(adev) && tx->busy) {
+		struct sk_buff *skb;
+		unsigned long flags;
 
+		spin_lock_irqsave(&adev->txst_q.lock, flags);
+		skb = tx->skb;
 		tx->skb = NULL;
-		ieee80211_tx_info_clear_status(info);
-		if (urb->status == 0 && !(info->flags & IEEE80211_TX_CTL_NO_ACK))
-			info->flags |= IEEE80211_TX_STAT_ACK;
-		ieee80211_tx_status_irqsafe(adev->hw, skb);
+		if (skb && tx->txst) {
+			if (urb->status) {
+				__skb_unlink(skb, &adev->txst_q);
+				acxusb_txst_report(adev, skb, NULL, true);
+			}
+		} else if (skb) {
+			struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+
+			ieee80211_tx_info_clear_status(info);
+			if (urb->status == 0 && !(info->flags & IEEE80211_TX_CTL_NO_ACK))
+				info->flags |= IEEE80211_TX_STAT_ACK;
+			ieee80211_tx_status_irqsafe(adev->hw, skb);
+		}
+		tx->txst = 0;
+		spin_unlock_irqrestore(&adev->txst_q.lock, flags);
 
 		tx->busy = 0;
 		adev->hw_tx_queue[0].free++;
-		if (adev->hw_tx_queue[0].free >= TX_START_QUEUE &&
-		    acx_queue_stopped(adev->hw)) {
-			acx_wake_queue(adev->hw, NULL);
-			ieee80211_queue_work(adev->hw, &adev->tx_work);
-		}
+		acxusb_txst_kick(adev);
 	}
 }
 
@@ -1384,6 +1571,12 @@ tx_t *acxusb_alloc_tx(acx_device_t *adev)
 	unsigned head;
 
 
+
+	if (acxusb_txst_full(adev)) {
+		log(L_BUFT, "acx: no tx credit (%u frames without status)\n",
+		    skb_queue_len(&adev->txst_q));
+		return NULL;
+	}
 
 	head =adev->hw_tx_queue[0].head;
 	do {
@@ -1474,7 +1667,6 @@ static void acxusb_1450_rate(u16 rate_100, u16 *mask, u8 *plcp)
 static int acxusb_1450_fill_txhdr(acx_device_t *adev, usb_txbuffer_t *txbuf,
 				  int wlanpkt_len, u16 rate_100)
 {
-	static u8 seq;
 	u8 *buf = (u8 *)txbuf;
 	u8 *desc;
 	int mps = usb_maxpacket(adev->usbdev,
@@ -1502,7 +1694,7 @@ static int acxusb_1450_fill_txhdr(acx_device_t *adev, usb_txbuffer_t *txbuf,
 	desc[10] = 0;
 	desc[11] = plcp;
 	memcpy(desc + 12, buf, 2);	/* frame control */
-	desc[14] = seq++;
+	desc[14] = adev->txst_seq++;
 	desc[15] = 0;
 
 	return len + ACXUSB_1450_TXHDRLEN;
@@ -1576,6 +1768,30 @@ void acxusb_tx_data(acx_device_t *adev, tx_t *tx_opaque, int wlanpkt_len,
 		}
 	}
 
+	tx->txst = 0;
+	if (IS_ACX111(adev)) {
+		u8 *desc = (u8 *)txbuf + txsize - ACXUSB_1450_TXHDRLEN;
+
+		if (acx_debug & L_TXSTAT)
+			pr_info("acx tx: seq %02x fc %04x len %d mask %04x plcp %02x "
+				"slot %d qlen %u\n", desc[14], get_unaligned_le16(desc + 12),
+				wlanpkt_len, get_unaligned_le16(desc + 8), desc[11], txnum,
+				skb_queue_len(&adev->txst_q));
+		if (acx_txstat) {
+			unsigned long flags;
+
+			acxusb_txst_stamp(skb)[0] = jiffies;
+			acxusb_txst_stamp(skb)[1] = desc[14];
+			spin_lock_irqsave(&adev->txst_q.lock, flags);
+			__skb_queue_tail(&adev->txst_q, skb);
+			tx->txst = 1;
+			if (!timer_pending(&adev->txst_timer))
+				mod_timer(&adev->txst_timer,
+					  jiffies + ACXUSB_TXST_TIMEOUT + 1);
+			spin_unlock_irqrestore(&adev->txst_q.lock, flags);
+		}
+	}
+
 	usb_fill_bulk_urb(txurb, usbdev, outpipe, txbuf,	/* dataptr */
 			  txsize,	/* size */
 			  acxusb_complete_tx,	/* handler */
@@ -1601,6 +1817,17 @@ void acxusb_tx_data(acx_device_t *adev, tx_t *tx_opaque, int wlanpkt_len,
 		 ** the statistics
 		 */
 		adev->stats.tx_errors++;
+		if (IS_ACX111(adev)) {
+			unsigned long flags;
+
+			spin_lock_irqsave(&adev->txst_q.lock, flags);
+			if (tx->txst)
+				__skb_unlink(skb, &adev->txst_q);
+			tx->txst = 0;
+			tx->skb = NULL;
+			spin_unlock_irqrestore(&adev->txst_q.lock, flags);
+			ieee80211_free_txskb(adev->hw, skb);
+		}
 		tx->busy = 0;
 		adev->hw_tx_queue[0].free++;
 		/* needed? if (adev->tx_free > TX_START_QUEUE) acx_wake_queue(...) */
@@ -1777,8 +2004,10 @@ static void acxusb_op_stop(struct ieee80211_hw *hw, bool suspend)
 
 	/* stop pending rx/tx urb transfers */
 	// OW TODO Maybe we need to report pending skbs in urbs still to mac80211 ? see wl1251 flush
-	for (i = 0; i < ACX_TX_URB_CNT; i++) {
+	for (i = 0; i < ACX_TX_URB_CNT; i++)
 		acxusb_unlink_urb(adev->usb_tx[i].urb);
+	acxusb_txst_purge(adev);
+	for (i = 0; i < ACX_TX_URB_CNT; i++) {
 		if (adev->usb_tx[i].skb) {
 			ieee80211_free_txskb(adev->hw, adev->usb_tx[i].skb);
 			adev->usb_tx[i].skb = NULL;
@@ -1994,11 +2223,13 @@ acxusb_probe(struct usb_interface *intf, const struct usb_device_id *devID)
 	    (int)TXBUFSIZE, (int)RXBUFSIZE);
 
 	/* Allocate the RX/TX containers. */
-	adev->usb_tx = kmalloc(sizeof(usb_tx_t) * ACX_TX_URB_CNT, GFP_KERNEL);
+	adev->usb_tx = kzalloc(sizeof(usb_tx_t) * ACX_TX_URB_CNT, GFP_KERNEL);
 	if (!adev->usb_tx) {
 		msg = "acx: no memory for tx container";
 		goto end_nomem;
 	}
+	skb_queue_head_init(&adev->txst_q);
+	timer_setup(&adev->txst_timer, acxusb_txst_timer, 0);
 	adev->usb_rx = kmalloc(sizeof(usb_rx_t) * ACX_RX_URB_CNT, GFP_KERNEL);
 	if (!adev->usb_rx) {
 		msg = "acx: no memory for rx container";
@@ -2051,6 +2282,15 @@ acxusb_probe(struct usb_interface *intf, const struct usb_device_id *devID)
 
 	// Debug and proc-fs
 	acx_debugfs_add_adev(adev);
+	if (adev->debugfs_dir) {
+		debugfs_create_u32("txst_matched", 0444, adev->debugfs_dir, &adev->txst_cnt.matched);
+		debugfs_create_u32("txst_acked", 0444, adev->debugfs_dir, &adev->txst_cnt.acked);
+		debugfs_create_u32("txst_skipped", 0444, adev->debugfs_dir, &adev->txst_cnt.skipped);
+		debugfs_create_u32("txst_orphan", 0444, adev->debugfs_dir, &adev->txst_cnt.orphan);
+		debugfs_create_u32("txst_timeout", 0444, adev->debugfs_dir, &adev->txst_cnt.timeout);
+		debugfs_create_u32("txst_fcmismatch", 0444, adev->debugfs_dir, &adev->txst_cnt.fcmismatch);
+		debugfs_create_u32("txst_latsum", 0444, adev->debugfs_dir, &adev->txst_cnt.latsum);
+	}
 
 	/* Init ieee80211_hw  */
 	acx_init_ieee80211(adev, hw);
@@ -2132,6 +2372,7 @@ static void acxusb_disconnect(struct usb_interface *intf)
 	 * deadlocking the machine.
 	 */
 	ieee80211_unregister_hw(adev->hw);
+	timer_delete_sync(&adev->txst_timer);
 
 	/* Driver unbind (rmmod) with the stick still plugged in: reboot the
 	 * firmware so the next probe finds the boot ROM again. */

@@ -552,6 +552,15 @@ struct acx_device {
 	int		bulkinep;	/* bulk-in endpoint */
 	int		bulkoutep;	/* bulk-out endpoint */
 	int		rxtruncsize;
+
+	/* TNETW1450 type-2 tx status: sent skbs wait here, in submit order */
+	struct sk_buff_head	txst_q;
+	struct timer_list	txst_timer;
+	u8			txst_seq;	/* tx descriptor byte 14 */
+	struct {
+		u32 matched, acked, skipped, orphan, timeout;
+		u32 fcmismatch, latsum;	/* latsum: jiffies submit -> record */
+	} txst_cnt;
 #endif
 };
 /* --- */

@@ -692,6 +692,7 @@ typedef struct usb_txstatus {
 
 typedef struct usb_tx {
 	unsigned	busy:1;
+	bool		txst;		/* skb also waits in adev->txst_q (own word: set under its lock, busy is not) */
 	struct urb	*urb;
 	acx_device_t	*adev;
 	struct sk_buff *skb;
