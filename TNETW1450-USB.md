@@ -151,6 +151,37 @@ tx status records.
   (`FEATURE2_NO_TXCRYPT | FEATURE2_SNIFFER`), otherwise encrypted rx frames are
   dropped and DHCP fails.
 
+## Information elements seen on fw 2.4.0.72
+
+IDs and lengths from `fwlanusb-lib.o` `whal_hwInfoElem*`, values read live
+(debugfs `ie`) while associated:
+
+| IE | TI function | len | live value / notes |
+|---|---|---|---|
+| 0x0002 | AcxPwrMgmtOptions | 0x18 | interrogate fails |
+| 0x0003 | ConfigMemory | 0x28 | interrogate fails. TI defaults: 32 rx descriptors (`NumACXRxDescriptors`), 16 tx, 4 tx data queues; acx sends 16 rx, 5×16 tx |
+| 0x000a | Aid | 2 | 0 (acx never sets it) |
+| 0x000e | FcsErrorRead | 4 | FCS error counter, **clear on read** |
+| 0x0010 | RxConfig | 4 | `10 00 f5 0f` |
+| 0x0012 | BssPowerSave | 1 | 0 (off) |
+| 0x0013 | statistics | 0x134 | longer than acx's struct; acx111 field names fit: +0x14 rx_dropped_frame (== FCS errors), +0x28 rx_dma_req (frames to host), +0x44 rx_cmplt |
+| 0x001f | AcxBeaconFilterOptions | 2 | 0 (off) |
+| 0x0023 | PacketDetectionThreshold | 4 | 0x70 |
+| 0x0025 | CcaThreshold | 2 | 0xffef |
+| 0x0027 | DtimPeriod | 2 | interrogate fails |
+| 0x100b | CurrAntenna | 2 | `4a 04` (fw default). TI writes rx byte from `dot11RxAntenna` (default 2): 1→0x0a, 2→0x2a, 3→0x4a, 4→0x6a; tx byte from `dot11TxAntenna` (default 2 → 0x04). Changing rx made no measurable difference |
+
+## Radio control in TI's host stack (not in acx)
+
+Registry defaults (`regFillInitTable`) point to host-side radio management that
+acx lacks: `CalibrationEnable` 1, `TddCalibrationInterval` 300,
+`CrtCalibrationInterval` 2, an LNA control loop (`whal_hwMboxCmd_LNAControl`;
+`LnaAgcHighThresh` 45, `LnaAgcLowThresh` 51, `LnaFftBadCorrCountThresh` 50,
+`LnaCheckTime` 2, `LnaRestoreTime` 600, `LnaPacketDetectionUnderACIHigh` 213) and
+hardware ACI settings (`HardwareACIMode` 0, `InputCCA` 1, `QualifiedCCA` 3,
+`StompForRx` 2, `TxCCA` 1; IE via `whal_hwInfoElemACIConfigurationSet`),
+`EnergyDetection` 255. Prime suspect for the time-varying rx loss at the PHY.
+
 ## Driver-side pitfalls fixed during the port (acx-mac80211 branch `port-7.2`)
 
 - USB-only build is required. With PCI built in, PCI-only functions run on the
