@@ -94,7 +94,7 @@
 #define VENDOR_ID_ZCOM			0x0cde
 #define PRODUCT_ID_ZCOM_XG750	0x0017	/* not tested yet */
 #define VENDOR_ID_TI			0x0451
-#define PRODUCT_ID_TI_UNKNOWN	0x60c5	/* not tested yet */
+#define PRODUCT_ID_TI_UNKNOWN	0x60c5	/* TNETW1450 after a USB port reset, unusable */
 
 // Module Data
 static const struct usb_device_id acxusb_ids[] = {
@@ -255,6 +255,25 @@ acxusb_1450_wait_ready(struct usb_device *usbdev, unsigned int inpipe, u8 *usbbu
 	return false;
 }
 
+/* Reboot a running TNETW1450 into its boot ROM, which then sends a new
+ * "ready" message. TI's whalCtrl_StopHal -> whalBus_FwCtrl_Reset does the
+ * same: ACX1xx_CMD_RESET (0x0000) without parameters on EP0, no response.
+ * A USB port reset instead leaves the chip half-alive as 0451:60c5. */
+static int acxusb_1450_fw_reset(struct usb_device *usbdev)
+{
+	u8 *buf;
+	int result;
+
+	buf = kzalloc(4, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	result = usb_control_msg(usbdev, usb_sndctrlpipe(usbdev, 0),
+				 ACX_USB_REQ_CMD, USB_TYPE_VENDOR | USB_DIR_OUT,
+				 0, 0, buf, 4, 500);
+	kfree(buf);
+	return result < 0 ? result : 0;
+}
+
 static int
 acxusb_boot(struct usb_device *usbdev, int is_tnetw1450, int *radio_type)
 {
@@ -274,7 +293,7 @@ acxusb_boot(struct usb_device *usbdev, int is_tnetw1450, int *radio_type)
 
 	/* dump_device(usbdev); */
 
-	usbbuf = kmalloc(USB_RWMEM_MAXLEN + 32, GFP_KERNEL);
+	usbbuf = kzalloc(USB_RWMEM_MAXLEN + 32, GFP_KERNEL);
 	if (!usbbuf) {
 		pr_err("no memory for USB transfer buffer (%d bytes)\n",
 		       USB_RWMEM_MAXLEN);
@@ -287,27 +306,23 @@ acxusb_boot(struct usb_device *usbdev, int is_tnetw1450, int *radio_type)
 		inpipe = usb_rcvbulkpipe(usbdev, 2);
 
 		/* The boot ROM sends its "ready" message only once after
-		 * power-up. If it doesn't come, the stick has been booted
-		 * before (module reload, warm reboot): reset the device like
-		 * AVM's fwlanusb does in probe, which restarts the boot ROM. */
+		 * power-up. If it doesn't come, the firmware is still running
+		 * (module reload without the reset in disconnect, warm
+		 * reboot): reboot it into the ROM and wait again. */
 		if (!acxusb_1450_wait_ready(usbdev, inpipe, usbbuf)) {
-			pr_info("acxusb: no ready message, firmware already running? "
-				"resetting device\n");
-			result = usb_reset_device(usbdev);
-			if (result) {
-				pr_err("acxusb: device reset failed: %d\n", result);
-				goto end;
-			}
-			usb_clear_halt(usbdev, outpipe);
-			usb_clear_halt(usbdev, inpipe);
+			pr_info("acxusb: no ready message, firmware still running; "
+				"sending reset command\n");
+			result = acxusb_1450_fw_reset(usbdev);
+			if (result)
+				pr_info("acxusb: reset command: %d\n", result);
 			if (!acxusb_1450_wait_ready(usbdev, inpipe, usbbuf)) {
-				pr_err("acxusb: device not ready for firmware upload "
-				       "after reset, please replug the stick\n");
-				goto fw_end;
+				pr_err("acxusb: device not ready for firmware upload, "
+				       "please replug the stick\n");
+				result = -ENODEV;
+				goto end;
 			}
 		}
 		pr_info("acxusb: device ready, radio type 0x%02X\n", usbbuf[8]);
-
 		*radio_type = usbbuf[8];
 	} else {
 		/* Obtain the I/O pipes */
@@ -449,6 +464,10 @@ acxusb_boot(struct usb_device *usbdev, int is_tnetw1450, int *radio_type)
 		result = 0;
 		goto end;
 	      fw_end:
+		pr_err("acxusb: TNETW1450 firmware upload failed (last result %d)\n",
+		       result);
+		print_hex_dump(KERN_ERR, "acxusb fw: ", DUMP_PREFIX_OFFSET, 16, 1,
+			       usbbuf + USB_RWMEM_MAXLEN, 20, false);
 		result = -EIO;
 		goto end;
 	} else {
@@ -1835,7 +1854,8 @@ acxusb_probe(struct usb_interface *intf, const struct usb_device_id *devID)
 		/* Boot the device (i.e. upload the firmware) */
 		result = acxusb_boot(usbdev, is_tnetw1450, &radio_type);
 		if (result) {
-			pr_err("acxusb: TNETW1450 firmware boot failed: %d\n", result);
+			pr_err("acxusb: TNETW1450 firmware boot failed: %d\n",
+			       result);
 			return result;
 		}
 
@@ -2087,6 +2107,13 @@ static void acxusb_disconnect(struct usb_interface *intf)
 	 * deadlocking the machine.
 	 */
 	ieee80211_unregister_hw(adev->hw);
+
+	/* Driver unbind (rmmod) with the stick still plugged in: reboot the
+	 * firmware so the next probe finds the boot ROM again. */
+	if (IS_ACX111(adev) &&
+	    adev->usbdev->state != USB_STATE_NOTATTACHED &&
+	    acxusb_1450_fw_reset(adev->usbdev) == 0)
+		log(L_INIT, "acxusb: firmware reset on unbind\n");
 
 	acx_debugfs_remove_adev(adev);
 

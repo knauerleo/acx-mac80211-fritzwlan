@@ -22,6 +22,7 @@ Where a field is marked *unknown*, the driver sets it to 0 and it still works.
 | CD-ROM (power-on) | 057c:62ff | usb-storage "FRITZ! WLAN selfinstall" with the Windows driver. `eject /dev/sr0` switches mode |
 | WLAN, firmware not loaded | 057c:6201 | vendor-class interface |
 | after firmware boot | 057c:6201 | same ID, no re-enumeration |
+| booted, then USB port reset | 0451:60c5 | half-dead, see "Rebooting a running firmware" |
 
 Endpoints: EP1 OUT bulk 512, EP2 IN bulk 512 (high speed). Commands
 (configure/interrogate) also go over EP0 control (`ACX_USB_REQ_CMD`) as in acx.
@@ -40,6 +41,20 @@ Endpoints: EP1 OUT bulk 512, EP2 IN bulk 512 (high speed). Commands
 4. Data in 2048-byte blocks, each u32 byte-swapped (be32). Optionally 4 zero
    bytes for padding.
 5. Read a 20-byte response: `u32[1] == 0` and `u16[8] == 1`. `0x40000003` means error.
+
+### Rebooting a running firmware
+
+The "ready" message comes only from the boot ROM. To get back there without
+replugging, send **`ACX1xx_CMD_RESET` (0x0000) with no parameters over EP0**
+(vendor request 0x12, 4 zero bytes, don't wait for a response). The ROM then
+sends a fresh ready message. TI's stack does the same on shutdown
+(`whalCtrl_StopHal` → `whalBus_FwCtrl_Reset` → `OsUsb_WriteCmdAsync`).
+
+A **USB port reset** (`usb_reset_device`, which AVM's glue code calls in probe)
+does *not* work on a booted stick. The chip re-enumerates as **0451:60c5**
+(class 0xe0, bcdDevice 1.84, no strings). In that state it stalls EP0 commands,
+sends no ready message, and accepts about 6 KB of a firmware upload before the
+bulk-out times out. Only replugging recovers it.
 
 ## Bulk-IN records (device → host)
 
