@@ -50,6 +50,29 @@ static u8 acx_signal_to_winlevel(u8 rawlevel)
 	return winlevel;
 }
 
+/*
+ * mac80211 wants dBm (<= 0): its beacon-signal EWMA adds -signal as an
+ * unsigned value, so positive levels wrap into garbage CQM RSSI events,
+ * and wpa_supplicant's bgscan then scans nonstop.  Radio formulas from TI's
+ * whalCtrl_convertRxLevelToRSSI (AVM fwlanusb-lib.o); for the older radios
+ * no formula is known, so shift the 0..100 level below 0.
+ */
+static int acx_signal_to_dbm(acx_device_t *adev, u8 rawlevel)
+{
+	switch (adev->radio_type) {
+	case RADIO_16_RADIA_RC2422:
+	case RADIO_17_UNKNOWN:
+		return rawlevel - 0x5d;
+	case RADIO_19_UNKNOWN:
+		return rawlevel - 0x62;
+	case 0x1a:
+	case RADIO_1B_TI_TNETW3422:
+		return (s8)rawlevel - 0x50;
+	default:
+		return acx_signal_to_winlevel(rawlevel) - 100;
+	}
+}
+
 u8 acx_signal_determine_quality(u8 signal, u8 noise)
 {
 	int qual;
@@ -117,7 +140,6 @@ static void acx_rx(acx_device_t *adev, rxbuffer_t *rxbuf)
 	struct ieee80211_hdr *w_hdr;
 	struct sk_buff *skb;
 	int buflen;
-	int level;
 
 	if (unlikely(!test_bit(ACX_FLAG_HW_UP, &adev->flags))) {
 		pr_info("asked to receive a packet while hw down\n");
@@ -142,13 +164,7 @@ static void acx_rx(acx_device_t *adev, rxbuffer_t *rxbuf)
 
 	status->mactime = rxbuf->time;
 
-	level = acx_signal_to_winlevel(rxbuf->phy_level);
-	/* FIXME cleanup ?: noise = acx_signal_to_winlevel(rxbuf->phy_snr); */
-
-	/* status->signal = acx_signal_determine_quality(level, noise);
-	 * TODO OW 20100619 On ACX100 seem to be always zero (seen during hx4700 tests ?!)
-	 */
-	status->signal = level;
+	status->signal = acx_signal_to_dbm(adev, rxbuf->phy_level);
 
 	if (adev->hw_encrypt_enabled && !(IS_USB(adev) && IS_ACX111(adev)))
 		status->flag = RX_FLAG_DECRYPTED | RX_FLAG_IV_STRIPPED;

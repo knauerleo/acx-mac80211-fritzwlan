@@ -522,11 +522,8 @@ int acx_init_ieee80211(acx_device_t *adev, struct ieee80211_hw *hw)
 	 * now, as they do not seem to be supported or how to acquire
 	 * them is still unknown. */
 
-	/* We base signal quality on winlevel approach of previous driver
-	 * TODO OW 20100615 This should into a common init code
-	 */
-	ieee80211_hw_set(hw, SIGNAL_UNSPEC);
-	hw->max_signal = 100;
+	/* rx signal is converted to dBm in acx_signal_to_dbm() */
+	ieee80211_hw_set(hw, SIGNAL_DBM);
 
 	if (IS_ACX100(adev)) {
 		adev->hw->wiphy->bands[NL80211_BAND_2GHZ] =
