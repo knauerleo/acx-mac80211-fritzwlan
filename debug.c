@@ -40,7 +40,7 @@
 
 enum file_index {
 	INFO, DIAG, EEPROM, PHY, DEBUG,
-	SENSITIVITY, TX_LEVEL, ANTENNA, REG_DOMAIN,
+	SENSITIVITY, TX_LEVEL, ANTENNA, REG_DOMAIN, IE,
 };
 static const char *const dbgfs_files[] = {
 	[INFO]		= "info",
@@ -52,9 +52,10 @@ static const char *const dbgfs_files[] = {
 	[TX_LEVEL]	= "tx_level",
 	[ANTENNA]	= "antenna",
 	[REG_DOMAIN]	= "reg_domain",
+	[IE]		= "ie",
 };
-BUILD_BUG_DECL(dbgfs_files__VS__enum_REG_DOMAIN,
-	ARRAY_SIZE(dbgfs_files) != REG_DOMAIN + 1);
+BUILD_BUG_DECL(dbgfs_files__VS__enum_IE,
+	ARRAY_SIZE(dbgfs_files) != IE + 1);
 
 static struct dentry *acx_dbgfs_dir;
 
@@ -798,6 +799,96 @@ out:
 	return ret;
 }
 
+/*
+ * "ie": raw firmware information elements by numeric id, for reverse
+ * engineering (the acx_ie table only knows acx's names and lengths).
+ *   echo "0x0012 2" > ie           select IE 0x0012, 2 data bytes
+ *   cat ie                         interrogate it, hex dump
+ *   echo "0x0012 2 0x01 0x00" > ie configure it with these data bytes
+ */
+#define ACX_DBGFS_IE_MAX 1020
+static u16 acx_dbgfs_ie_id = 0x0002, acx_dbgfs_ie_len = 0x18;
+
+static int acx_dbgfs_show_ie(struct seq_file *file, void *v)
+{
+	acx_device_t *adev = (acx_device_t *) file->private;
+	u8 *buf;
+	int res;
+
+	buf = kzalloc(ACX_DBGFS_IE_MAX + 4, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	acx_sem_lock(adev);
+	put_unaligned_le16(acx_dbgfs_ie_id, buf);
+	put_unaligned_le16(acx_dbgfs_ie_len, buf + 2);
+	res = acx_issue_cmd(adev, ACX1xx_CMD_INTERROGATE, buf,
+			    acx_dbgfs_ie_len + 4);
+	acx_sem_unlock(adev);
+
+	seq_printf(file, "ie 0x%04x len %u: %s\n", acx_dbgfs_ie_id,
+		   acx_dbgfs_ie_len, res == OK ? "ok" : "FAILED");
+	if (res == OK)
+		seq_hex_dump(file, "", DUMP_PREFIX_OFFSET, 16, 1, buf,
+			     acx_dbgfs_ie_len + 4, false);
+	kfree(buf);
+	return 0;
+}
+
+static ssize_t acx_dbgfs_write_ie(acx_device_t *adev, struct file *file,
+				  const char __user *ubuf, size_t count,
+				  loff_t *ppos)
+{
+	char *kbuf, *p, *tok;
+	u8 *cfg = NULL;
+	unsigned long val;
+	int n = 0, res = OK;
+	ssize_t ret = -EINVAL;
+	u16 id = 0, len = 0;
+
+	kbuf = memdup_user_nul(ubuf, min_t(size_t, count, 1024));
+	if (IS_ERR(kbuf))
+		return PTR_ERR(kbuf);
+	cfg = kzalloc(ACX_DBGFS_IE_MAX + 4, GFP_KERNEL);
+	if (!cfg)
+		goto out;
+
+	p = kbuf;
+	while ((tok = strsep(&p, " \t\n")) != NULL) {
+		if (!*tok)
+			continue;
+		if (kstrtoul(tok, 0, &val))
+			goto out;
+		if (n == 0)
+			id = val;
+		else if (n == 1 && val <= ACX_DBGFS_IE_MAX)
+			len = val;
+		else if (n == 1)
+			goto out;
+		else if (n - 2 < len)
+			cfg[4 + n - 2] = val;
+		n++;
+	}
+	if (n < 2)
+		goto out;
+	acx_dbgfs_ie_id = id;
+	acx_dbgfs_ie_len = len;
+	if (n > 2) {
+		put_unaligned_le16(id, cfg);
+		put_unaligned_le16(len, cfg + 2);
+		acx_sem_lock(adev);
+		res = acx_issue_cmd(adev, ACX1xx_CMD_CONFIGURE, cfg, len + 4);
+		acx_sem_unlock(adev);
+		pr_info("acx: debugfs configure ie 0x%04x len %u: %s\n",
+			id, len, res == OK ? "ok" : "FAILED");
+	}
+	ret = res == OK ? count : -EIO;
+out:
+	kfree(cfg);
+	kfree(kbuf);
+	return ret;
+}
+
 static acx_dbgfs_show_t *const acx_dbgfs_show_funcs[] = {
 	acx_dbgfs_show_acx,
 	acx_dbgfs_show_diag,
@@ -808,6 +899,7 @@ static acx_dbgfs_show_t *const acx_dbgfs_show_funcs[] = {
 	acx_dbgfs_show_tx_level,
 	acx_dbgfs_show_antenna,
 	acx_dbgfs_show_reg_domain,
+	acx_dbgfs_show_ie,
 };
 
 static acx_dbgfs_write_t *const acx_dbgfs_write_funcs[] = {
@@ -820,6 +912,7 @@ static acx_dbgfs_write_t *const acx_dbgfs_write_funcs[] = {
 	acx_dbgfs_write_tx_level,
 	acx_dbgfs_write_antenna,
 	acx_dbgfs_write_reg_domain,
+	acx_dbgfs_write_ie,
 };
 BUILD_BUG_DECL(acx_proc_show_funcs__VS__acx_proc_write_funcs,
 	ARRAY_SIZE(acx_dbgfs_show_funcs) != ARRAY_SIZE(acx_dbgfs_write_funcs));
@@ -840,6 +933,7 @@ static int acx_dbgfs_open(struct inode *inode, struct file *file)
 	case TX_LEVEL:
 	case ANTENNA:
 	case REG_DOMAIN:
+	case IE:
 		pr_devel("opening filename=%s fmode=%o fidx=%d adev=%p\n",
 			dbgfs_files[fidx], file->f_mode, (int)fidx, adev);
 		break;
@@ -869,6 +963,7 @@ static ssize_t acx_dbgfs_write(struct file *file, const char __user *buf,
 	case TX_LEVEL:
 	case ANTENNA:
 	case REG_DOMAIN:
+	case IE:
 		pr_devel("opening filename=%s fmode=%o fidx=%d adev=%p\n",
 			dbgfs_files[fidx], file->f_mode, (int)fidx, adev);
 		break;
