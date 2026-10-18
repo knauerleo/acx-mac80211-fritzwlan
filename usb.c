@@ -591,7 +591,12 @@ acxusb_issue_cmd_timeo_debug(acx_device_t * adev,
 	    cmdstr, buflen,
 	    buffer ? le16_to_cpu(((acx_ie_generic_t *) buffer)->type) : -1);
 
-	loc = kmalloc(buflen + 4 + BOGUS_SAFETY_PADDING, GFP_KERNEL);
+	/* interrogate answers can be longer than acx asks for (TNETW1450
+	 * fw 2.4.0.72 returns a bigger FIRMWARE_STATISTICS -> -EOVERFLOW),
+	 * so read into a buffer of at least ACXUSB_CMD_RESP_MAX bytes */
+	#define ACXUSB_CMD_RESP_MAX 1024
+	loc = kmalloc(max_t(unsigned, buflen, ACXUSB_CMD_RESP_MAX) + 4 +
+		      BOGUS_SAFETY_PADDING, GFP_KERNEL);
 	if (!loc) {
 		pr_acx("%s: no memory for data buffer\n", devname);
 		goto bad;
@@ -622,7 +627,7 @@ acxusb_issue_cmd_timeo_debug(acx_device_t * adev,
 		 * of parameters to read, as data */
 		if (cmd == ACX1xx_CMD_INTERROGATE) {
 			blocklen = 4;
-			acklen = buflen + 4;
+			acklen = max_t(unsigned, buflen, ACXUSB_CMD_RESP_MAX) + 4;
 		}
 		memcpy(loc->data, buffer, blocklen);
 	}
