@@ -40,6 +40,7 @@
 #include <linux/moduleparam.h>
 #include <linux/kernel.h>
 #include <linux/usb.h>
+#include <linux/unaligned.h>
 #include <linux/netdevice.h>
 #include <linux/rtnetlink.h>
 #include <linux/etherdevice.h>
@@ -831,6 +832,112 @@ static void dump_device_descriptor(struct usb_device_descriptor *dd)
  * USB receive is triggered.
  */
 static void acxusb_poll_rx(acx_device_t * adev, usb_rx_t * rx);
+/* Report a tx status record (USB: rx record with bit 15 of mac_cnt_rcvd set) */
+static void acxusb_handle_txstat(acx_device_t *adev, usb_txstatus_t *stat)
+{
+	usb_tx_t *tx;
+	struct sk_buff *skb;
+	struct ieee80211_tx_info *txstatus;
+
+
+			/* do rate handling */
+			// OW TODO rate handling done by mac80211
+
+			log(L_USBRXTX,
+					"acx: tx: stat: mac_cnt_rcvd:%04X "
+					"queue_index:%02X mac_status:%02X "
+					"hostdata:%08X rate:%u ack_failures:%02X "
+					"rts_failures:%02X rts_ok:%02X\n",
+					stat->mac_cnt_rcvd, stat->queue_index,
+					stat->mac_status, stat->hostdata, stat->rate,
+					stat->ack_failures, stat->rts_failures,
+					stat->rts_ok);
+
+		if (unlikely(stat->hostdata >= ACX_TX_URB_CNT)) {
+			printk_ratelimited(KERN_WARNING "acxusb: bogus txstat hostdata %u\n",
+					   stat->hostdata);
+			return;
+		}
+		tx = adev->usb_tx + stat->hostdata;
+		skb = tx->skb;
+		if (unlikely(!tx->busy || !skb)) {
+			printk_ratelimited(KERN_WARNING "acxusb: txstat for idle buffer %u\n",
+					   stat->hostdata);
+			return;
+		}
+		tx->skb = NULL;
+		txstatus = IEEE80211_SKB_CB(skb);
+
+            if (!(txstatus->flags & IEEE80211_TX_CTL_NO_ACK))
+			txstatus->flags |= IEEE80211_TX_STAT_ACK;
+
+		txstatus->status.rates[0].count = stat->ack_failures + 1;
+
+		// report upstream
+		ieee80211_tx_status_skb(adev->hw, skb);
+
+		tx->busy = 0;
+		adev->hw_tx_queue[0].free++;
+
+		if ((adev->hw_tx_queue[0].free >= TX_START_QUEUE) && acx_queue_stopped(adev->hw)) {
+			log(L_BUF, "tx: wake queue (avail. Tx desc %u)\n",
+				adev->hw_tx_queue[0].free);
+			acx_wake_queue(adev->hw, NULL);
+			ieee80211_queue_work(adev->hw, &adev->tx_work);
+		}
+
+			return;
+}
+
+/*
+ * TNETW1450 firmware (seen with Rev 2.4.0.72) prefixes every record in a
+ * bulk-in transfer with a 20-byte header:
+ *   le16 total_len   (header + payload)
+ *   u8   seq, u8 0xc6
+ *   le16 payload_len (== total_len - 20 == RXBUF_BYTES_USED(payload))
+ *   le16 0x000b, ...
+ * followed by the classic rxbuffer_t.  The old acx code parsed the header
+ * as rxbuffer_t, which produced garbage lengths and overwrote memory.
+ */
+#define ACXUSB_1450_HDRLEN 20
+
+static void acxusb_rx_tnetw1450(acx_device_t *adev, u8 *buf, int size)
+{
+	int off = 0;
+
+	while (size - off >= ACXUSB_1450_HDRLEN + RXBUF_HDRSIZE) {
+		u8 *rec = buf + off;
+		int total = get_unaligned_le16(rec);
+		int plen = get_unaligned_le16(rec + 4);
+		rxbuffer_t *rxbuf = (rxbuffer_t *)(rec + ACXUSB_1450_HDRLEN);
+
+		if (total < ACXUSB_1450_HDRLEN + RXBUF_HDRSIZE ||
+		    total > size - off ||
+		    plen != total - ACXUSB_1450_HDRLEN) {
+			printk_ratelimited(KERN_WARNING "acxusb: unknown rx record at %d/%d "
+					   "(total %d, plen %d)\n", off, size, total, plen);
+			if (net_ratelimit())
+				print_hex_dump(KERN_WARNING, "acxusb rec: ", DUMP_PREFIX_OFFSET,
+					       16, 1, rec, min(size - off, 64), false);
+			return;
+		}
+
+		if (RXBUF_IS_TXSTAT(rxbuf)) {
+			if (net_ratelimit())
+				print_hex_dump(KERN_INFO, "acxusb txstat: ", DUMP_PREFIX_OFFSET,
+					       16, 1, rec, min(total, 48), false);
+			acxusb_handle_txstat(adev, (usb_txstatus_t *)rxbuf);
+		} else if (RXBUF_BYTES_USED(rxbuf) > plen) {
+			printk_ratelimited(KERN_WARNING "acxusb: rx frame len %d exceeds "
+					   "record %d\n", RXBUF_BYTES_USED(rxbuf), plen);
+		} else {
+			acx_process_rxbuf(adev, rxbuf);
+		}
+
+		off += total;
+	}
+}
+
 static void acxusb_complete_rx(struct urb *urb)
 {
 	acx_device_t *adev;
@@ -838,9 +945,6 @@ static void acxusb_complete_rx(struct urb *urb)
 	rxbuffer_t *inbuf;
 	usb_rx_t *rx;
 	int size, remsize, packetsize, rxnum;
-	usb_tx_t *tx;
-	struct sk_buff *skb;
-	struct ieee80211_tx_info *txstatus;
 	// unsigned long flags;
 
 
@@ -914,7 +1018,7 @@ static void acxusb_complete_rx(struct urb *urb)
 	if (unlikely(!size))
 		pr_acx("warning, encountered zerolength rx packet\n");
 
-	if (urb->status == 0 && size && net_ratelimit()) {
+	if ((acx_debug & L_DATA) && urb->status == 0 && size && net_ratelimit()) {
 		pr_info("acxusb: rx urb %d: %d bytes\n", rxnum, size);
 		print_hex_dump(KERN_INFO, "acxusb rx: ", DUMP_PREFIX_OFFSET,
 			       16, 1, inbuf, min(size, 96), false);
@@ -922,6 +1026,11 @@ static void acxusb_complete_rx(struct urb *urb)
 
 	if (urb->transfer_buffer != inbuf)
 		return;
+
+	if (IS_ACX111(adev)) {
+		acxusb_rx_tnetw1450(adev, (u8 *)inbuf, size);
+		return;
+	}
 
 	/* check if previous frame was truncated
 	 ** FIXME: this code can only handle truncation
@@ -996,54 +1105,7 @@ static void acxusb_complete_rx(struct urb *urb)
 			"acxusb: packet with packetsize=%d\n", packetsize);
 
 		if (RXBUF_IS_TXSTAT(ptr)) {
-
-			/* do rate handling */
-			// OW TODO rate handling done by mac80211
-			usb_txstatus_t *stat = (void *)ptr;
-
-			log(L_USBRXTX,
-					"acx: tx: stat: mac_cnt_rcvd:%04X "
-					"queue_index:%02X mac_status:%02X "
-					"hostdata:%08X rate:%u ack_failures:%02X "
-					"rts_failures:%02X rts_ok:%02X\n",
-					stat->mac_cnt_rcvd, stat->queue_index,
-					stat->mac_status, stat->hostdata, stat->rate,
-					stat->ack_failures, stat->rts_failures,
-					stat->rts_ok);
-
-		if (unlikely(stat->hostdata >= ACX_TX_URB_CNT)) {
-			printk_ratelimited(KERN_WARNING "acxusb: bogus txstat hostdata %u\n",
-					   stat->hostdata);
-			goto next;
-		}
-		tx = adev->usb_tx + stat->hostdata;
-		skb = tx->skb;
-		if (unlikely(!tx->busy || !skb)) {
-			printk_ratelimited(KERN_WARNING "acxusb: txstat for idle buffer %u\n",
-					   stat->hostdata);
-			goto next;
-		}
-		tx->skb = NULL;
-		txstatus = IEEE80211_SKB_CB(skb);
-
-            if (!(txstatus->flags & IEEE80211_TX_CTL_NO_ACK))
-			txstatus->flags |= IEEE80211_TX_STAT_ACK;
-
-		txstatus->status.rates[0].count = stat->ack_failures + 1;
-
-		// report upstream
-		ieee80211_tx_status_skb(adev->hw, skb);
-
-		tx->busy = 0;
-		adev->hw_tx_queue[0].free++;
-
-		if ((adev->hw_tx_queue[0].free >= TX_START_QUEUE) && acx_queue_stopped(adev->hw)) {
-			log(L_BUF, "tx: wake queue (avail. Tx desc %u)\n",
-				adev->hw_tx_queue[0].free);
-			acx_wake_queue(adev->hw, NULL);
-			ieee80211_queue_work(adev->hw, &adev->tx_work);
-		}
-
+			acxusb_handle_txstat(adev, (void *)ptr);
 			goto next;
 		}
 
