@@ -357,8 +357,14 @@ acxusb_boot(struct usb_device *usbdev, int is_tnetw1450, int *radio_type)
 		cmdbuf = usbbuf + USB_RWMEM_MAXLEN;	/* DMA-safe, not on stack */
 		memset(cmdbuf, 0, 16);
 
+		/* AVM fwlanusb os_usb_need_file_padding: pad when the image
+		 * takes an even number of bulk *packets* (wMaxPacketSize),
+		 * not 2048-byte transfers. For FwUSB1b.bin (97352 bytes) the
+		 * two rules disagree (191 packets: no pad; 48 blocks: pad). */
 		need_padding =
-		    acxusb_fw_needs_padding(fw_image, USB_RWMEM_MAXLEN);
+		    acxusb_fw_needs_padding(fw_image, usb_maxpacket(usbdev, outpipe));
+		pr_info("acxusb: firmware padding %d (wMaxPacketSize %d)\n",
+			need_padding, usb_maxpacket(usbdev, outpipe));
 		tmplen = need_padding ? file_size - 4 : file_size - 8;
 		*(u16 *) & cmdbuf[0] = 0xc000;
 		*(u16 *) & cmdbuf[2] = 0x000b;
