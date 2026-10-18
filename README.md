@@ -46,7 +46,7 @@ Needs: kernel headers, `dkms`, `bsdtar` (libarchive), `eject` (util-linux),
 systemd/udev.
 
 ```sh
-git clone <this repository> && cd acx-mac80211-fritzwlan
+git clone https://github.com/knauerleo/acx-mac80211-fritzwlan && cd acx-mac80211-fritzwlan
 sudo scripts/fritzwlan-install.sh        # plug the stick in when asked
 # later: replug the stick -> wlan interface (e.g. wlp0s20u9)
 sudo scripts/fritzwlan-install.sh uninstall
