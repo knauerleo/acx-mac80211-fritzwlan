@@ -1586,8 +1586,12 @@ static void acxusb_op_stop(struct ieee80211_hw *hw, bool suspend)
 	acx_issue_cmd(adev, ACX1xx_CMD_DISABLE_RX, NULL, 0);
 	acx_issue_cmd(adev, ACX1xx_CMD_DISABLE_TX, NULL, 0);
 
-	/* Power down the device */
-	acx_issue_cmd(adev, ACX1xx_CMD_SLEEP, NULL, 0);
+	/* Power down the device -- not on TNETW1450: after CMD_SLEEP the
+	 * firmware never delivers rx again, even after CMD_WAKE, so the
+	 * down/up cycle NetworkManager does for MAC randomisation left the
+	 * interface deaf. */
+	if (!IS_ACX111(adev))
+		acx_issue_cmd(adev, ACX1xx_CMD_SLEEP, NULL, 0);
 
 	acx_sem_unlock(adev);
 	cancel_work_sync(&adev->irq_work);
