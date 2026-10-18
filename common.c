@@ -167,7 +167,7 @@ MODULE_PARM_DESC(debug, "Debug level mask (see L_xxx constants)");
 static const char *flag_names[] = {
 	"L_LOCK", "L_INIT", "L_IRQ", "L_ASSOC", "undef", "undef",
 	"undef", "L_XFER", "L_DATA", "L_DEBUG", "L_IOCTL", "L_CTL",
-	"L_BUFR", "undef", "L_BUFT", "L_USBRXTX",
+	"L_BUFR", "L_TXSTAT", "L_BUFT", "L_USBRXTX",
 };
 BUILD_BUG_DECL(flag_names, ARRAY_SIZE(flag_names) != 16);
 

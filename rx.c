@@ -178,14 +178,19 @@ static void acx_rx(acx_device_t *adev, rxbuffer_t *rxbuf)
 	 * this didn't made a difference. Maybe compare what other drivers do.
 	 * TODO Verify translation to rate_idx.
 	 */
-#if 0
-	if (rxbuf->phy_stat_baseband & (1 << 3)) /* Uses OFDM */
-		status->rate_idx =
-			acx_plcp_get_bitrate_ofdm(rxbuf->phy_plcp_signal);
-	else
-		status->rate_idx =
-			acx_plcp_get_bitrate_cck(rxbuf->phy_plcp_signal);
-#endif
+	if (IS_ACX111(adev)) {
+		u8 plcp = rxbuf->phy_plcp_signal;
+		/* phy_stat_baseband bit 3 = OFDM (acx); only 0x0a needs it */
+		int ofdm = plcp == 0x0a ? !!(rxbuf->phy_stat_baseband & 0x08) :
+			   acx111_plcp_to_rate_idx(plcp, 0) < 0;
+		int idx = acx111_plcp_to_rate_idx(plcp, ofdm);
+
+		if (idx >= 0)
+			status->rate_idx = idx;
+		if (acx_debug & L_TXSTAT)
+			printk_ratelimited(KERN_INFO "acx rx: plcp %02x bb %02x -> idx %d len %d\n",
+					   plcp, rxbuf->phy_stat_baseband, idx, buflen);
+	}
 
 	adev->stats.rx_packets++;
 	adev->stats.rx_bytes += skb->len;
@@ -273,61 +278,31 @@ void acx_process_rxbuf(acx_device_t *adev, rxbuffer_t *rxbuf)
 
 }
 
-/* TODO Verify these functions: translation rxbuffer.phy_plcp_signal to rate_idx */
-#if 0
-
-/** Rate values **/
-#define ACX_CCK_RATE_1MB            0
-#define ACX_CCK_RATE_2MB            1
-#define ACX_CCK_RATE_5MB            2
-#define ACX_CCK_RATE_11MB           3
-#define ACX_OFDM_RATE_6MB           4
-#define ACX_OFDM_RATE_9MB           5
-#define ACX_OFDM_RATE_12MB          6
-#define ACX_OFDM_RATE_18MB          7
-#define ACX_OFDM_RATE_24MB          8
-#define ACX_OFDM_RATE_36MB          9
-#define ACX_OFDM_RATE_48MB          10
-#define ACX_OFDM_RATE_54MB          11
-
-static u8 acx_plcp_get_bitrate_cck(u8 plcp)
+/*
+ * PLCP signal byte -> index into acx111_rates[] (main.c: 1 2 5.5 6 9 11 12 18
+ * 24 36 48 54). CCK codes are the rate in 100 kbit/s, OFDM codes are the
+ * 802.11a SIGNAL rate nibble. 0x0a is 1M CCK and 12M OFDM; the caller says
+ * which (rx: phy_stat_baseband, tx status: the rate mask). -1 if unknown.
+ */
+int acx111_plcp_to_rate_idx(u8 plcp, int ofdm)
 {
-        switch (plcp) {
-        case 0x0A:
-                return ACX_CCK_RATE_1MB;
-        case 0x14:
-                return ACX_CCK_RATE_2MB;
-        case 0x37:
-                return ACX_CCK_RATE_5MB;
-        case 0x6E:
-                return ACX_CCK_RATE_11MB;
-        }
-        return 0;
-}
+	static const u8 cck[] = { 0x0a, 0x14, 0x37, 0x00, 0x00, 0x6e };
+	static const u8 ofdm_sig[12] = {
+		[3] = 0xb, [4] = 0xf, [6] = 0xa, [7] = 0xe,
+		[8] = 0x9, [9] = 0xd, [10] = 0x8, [11] = 0xc,
+	};
+	int i;
 
-/* Extract the bitrate out of an OFDM PLCP header. */
-static u8 acx_plcp_get_bitrate_ofdm(u8 plcp)
-{
-        switch (plcp & 0xF) {
-        case 0xB:
-                return ACX_OFDM_RATE_6MB;
-        case 0xF:
-                return ACX_OFDM_RATE_9MB;
-        case 0xA:
-                return ACX_OFDM_RATE_12MB;
-        case 0xE:
-                return ACX_OFDM_RATE_18MB;
-        case 0x9:
-                return ACX_OFDM_RATE_24MB;
-        case 0xD:
-                return ACX_OFDM_RATE_36MB;
-        case 0x8:
-                return ACX_OFDM_RATE_48MB;
-        case 0xC:
-                return ACX_OFDM_RATE_54MB;
-        }
-        return 0;
+	if (!ofdm) {
+		for (i = 0; i < ARRAY_SIZE(cck); i++)
+			if (cck[i] && cck[i] == plcp)
+				return i;
+		return -1;
+	}
+	for (i = 0; i < ARRAY_SIZE(ofdm_sig); i++)
+		if (ofdm_sig[i] && ofdm_sig[i] == (plcp & 0xf))
+			return i;
+	return -1;
 }
-#endif
 
 

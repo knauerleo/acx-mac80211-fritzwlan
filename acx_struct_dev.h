@@ -37,6 +37,7 @@ enum debug_flags {
 	L_IOCTL		= (ACX_DEBUG>0)*0x0400,	/* log ioctl calls */
 	L_CTL		= (ACX_DEBUG>1)*0x0800,	/* log of low-level ctl commands */
 	L_BUFR		= (ACX_DEBUG>1)*0x1000,	/* debug rx buffer mgmt (ring buffer etc.) */
+	L_TXSTAT	= (ACX_DEBUG>0)*0x2000,	/* one line per tx frame / tx status / rx rate */
 	L_BUFT		= (ACX_DEBUG>1)*0x4000,	/* debug tx buffer mgmt (ring buffer etc.) */
 	L_USBRXTX	= (ACX_DEBUG>0)*0x8000,	/* debug USB rx/tx operations */
 	L_BUF		= L_BUFR + L_BUFT,
