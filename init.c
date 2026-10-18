@@ -225,6 +225,11 @@ static int acx111_create_dma_regions(acx_device_t *adev)
 	 * we want (using linked host descs with their allocated mem).
 	 * 2 == Generic Bus Slave */
 	/* done by memset: memconf.options = 0; */
+	/* USB (TNETW1450): fwlanusb.sys FUN_0004221e hands FUN_00030ea2
+	 * options = 4 and host_rx_start = 0. With 0 (busmaster indirect)
+	 * the firmware wedges on the first transmitted frame. */
+	if (IS_USB(adev))
+		memconf.options = 4;
 	/* let's use 25% for fragmentations and 75% for frame transfers
 	 * (specified in units of 5%) */
 	memconf.fragmentation = ACX111_PERCENT(75);
