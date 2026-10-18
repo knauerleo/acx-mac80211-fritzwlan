@@ -83,6 +83,8 @@ Types per `fwlanusb.sys` FUN_000427f2 / FUN_00042a70:
 +8   le32 device address of the rx descriptor (steps 0x28 through rx_queue_start ring)
 +12  ...  rest of the chip's rx descriptor (unknown)
 +20  rxbuffer_t (classic acx: mac_cnt_rcvd, mblks, mac_status, phy_stat, plcp, level, snr, le32 time)
+     level → dBm per TI whalCtrl_convertRxLevelToRSSI: radio 0x1b/0x1a (s8)level - 80,
+     0x16/0x17 level - 0x5d, 0x19 level - 0x62 (gives -24 dBm next to the router)
 +32  8-byte phy header
 +40  802.11 frame (mac_cnt_rcvd & 0xfff includes the 8 phy bytes)
 ```
@@ -164,7 +166,7 @@ IDs and lengths from `fwlanusb-lib.o` `whal_hwInfoElem*`, values read live
 | 0x000e | FcsErrorRead | 4 | FCS error counter, **clear on read** |
 | 0x0010 | RxConfig | 4 | `10 00 f5 0f` |
 | 0x0012 | BssPowerSave | 1 | 0 (off) |
-| 0x0013 | statistics | 0x134 | longer than acx's struct; acx111 field names fit: +0x14 rx_dropped_frame (== FCS errors), +0x28 rx_dma_req (frames to host), +0x44 rx_cmplt |
+| 0x0013 | statistics | 0x134 | longer than acx's struct; acx111 field names fit: +0x14 rx_dropped_frame (~FCS errors), +0x18 rx_frame_ptr_err (~30/10 s, meaning unknown), +0x28 rx_dma_req, +0x30 tx_dma_req, +0x38 cmd_cmplt (== +0x68 commands), +0x44 rx_cmplt. These count **interrupts/DMA transfers, not frames** (mac80211 saw 238 frames while rx_dma_req went +147) |
 | 0x001f | AcxBeaconFilterOptions | 2 | 0 (off) |
 | 0x0023 | PacketDetectionThreshold | 4 | 0x70 |
 | 0x0025 | CcaThreshold | 2 | 0xffef |
@@ -180,7 +182,9 @@ acx lacks: `CalibrationEnable` 1, `TddCalibrationInterval` 300,
 `LnaCheckTime` 2, `LnaRestoreTime` 600, `LnaPacketDetectionUnderACIHigh` 213) and
 hardware ACI settings (`HardwareACIMode` 0, `InputCCA` 1, `QualifiedCCA` 3,
 `StompForRx` 2, `TxCCA` 1; IE via `whal_hwInfoElemACIConfigurationSet`),
-`EnergyDetection` 255. Prime suspect for the time-varying rx loss at the PHY.
+`EnergyDetection` 255. Once suspected for the time-varying rx loss, but that was
+the driver's signal reporting (garbage CQM RSSI → bgscan loop, fixed in 5662f64).
+Still relevant if sensitivity at a distance turns out to be poor.
 
 ## Driver-side pitfalls fixed during the port (acx-mac80211 branch `port-7.2`)
 
@@ -193,5 +197,8 @@ hardware ACI settings (`HardwareACIMode` 0, `InputCCA` 1, `QualifiedCCA` 3,
   after the rx submit → rx dead after down/up. Now `usb_kill_urb`, HW_UP first.
 - rx resubmit livelock on persistent URB errors; unchecked txstat `hostdata`
   index; rx stats use-after-free; tx rate stored in u8 (540 = 54M overflowed).
+- rx signal reported as `SIGNAL_UNSPEC` 0..100: mac80211's beacon EWMA wrapped,
+  garbage CQM RSSI events made wpa_supplicant bgscan scan nonstop (~50 % loss).
+  Now dBm (`acx_signal_to_dbm`).
 - `debugflags=` name table is shifted against the real bit values. Use the
   numeric `debug=` instead (0x8282 = USBRXTX|XFER|DEBUG|INIT; 0x100 = L_DATA).
