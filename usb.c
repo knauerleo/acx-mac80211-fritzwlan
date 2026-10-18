@@ -905,6 +905,13 @@ static void acxusb_rx_tnetw1450(acx_device_t *adev, u8 *buf, int size)
 {
 	int off = 0;
 
+	if (size < ACXUSB_1450_HDRLEN + RXBUF_HDRSIZE) {
+		/* short firmware record (seen: 24 bytes), purpose unknown yet */
+		pr_info("acxusb: short rx record, %d bytes\n", size);
+		print_hex_dump(KERN_INFO, "acxusb short: ", DUMP_PREFIX_OFFSET,
+			       16, 1, buf, size, false);
+	}
+
 	while (size - off >= ACXUSB_1450_HDRLEN + RXBUF_HDRSIZE) {
 		u8 *rec = buf + off;
 		int total = get_unaligned_le16(rec);
