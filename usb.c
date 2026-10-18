@@ -235,6 +235,26 @@ int acxusb_fw_needs_padding(firmware_image_t *fw_image,
  * firmware and transmitting the checksum, the device resets and appears
  * as a new device on the USB bus (the device we can finally deal with)
  */
+static bool
+acxusb_1450_wait_ready(struct usb_device *usbdev, unsigned int inpipe, u8 *usbbuf)
+{
+	int i, num_processed;
+
+	pr_debug("wait for device ready\n");
+	for (i = 0; i <= 2; i++) {
+		memset(usbbuf, 0, 12);
+		if (usb_bulk_msg(usbdev, inpipe, usbbuf, USB_RWMEM_MAXLEN,
+				 &num_processed, 2000) == 0
+		    && num_processed >= 12
+		    && get_unaligned_le32(&usbbuf[4]) == 0x40000001
+		    && get_unaligned_le16(&usbbuf[2]) == 0x1
+		    && get_unaligned_le16(usbbuf) == 0xc000)
+			return true;
+		acx_mwait(10);
+	}
+	return false;
+}
+
 static int
 acxusb_boot(struct usb_device *usbdev, int is_tnetw1450, int *radio_type)
 {
@@ -266,23 +286,25 @@ acxusb_boot(struct usb_device *usbdev, int is_tnetw1450, int *radio_type)
 		outpipe = usb_sndbulkpipe(usbdev, 1);
 		inpipe = usb_rcvbulkpipe(usbdev, 2);
 
-		pr_debug("wait for device ready\n");
-		for (i = 0; i <= 2; i++) {
-			result = usb_bulk_msg(usbdev, inpipe,
-					      usbbuf,
-					      USB_RWMEM_MAXLEN,
-					      &num_processed, 2000);
-
-			if ((*(u32 *) & usbbuf[4] == 0x40000001)
-			    && (*(u16 *) & usbbuf[2] == 0x1)
-			    && ((*(u16 *) usbbuf & 0x3fff) == 0)
-			    && ((*(u16 *) usbbuf & 0xc000) == 0xc000))
-				break;
-			acx_mwait(10);
-		}
-		if (i > 2) {
-			pr_err("acxusb: device not ready for firmware upload (result %d)\n", result);
-			goto fw_end;
+		/* The boot ROM sends its "ready" message only once after
+		 * power-up. If it doesn't come, the stick has been booted
+		 * before (module reload, warm reboot): reset the device like
+		 * AVM's fwlanusb does in probe, which restarts the boot ROM. */
+		if (!acxusb_1450_wait_ready(usbdev, inpipe, usbbuf)) {
+			pr_info("acxusb: no ready message, firmware already running? "
+				"resetting device\n");
+			result = usb_reset_device(usbdev);
+			if (result) {
+				pr_err("acxusb: device reset failed: %d\n", result);
+				goto end;
+			}
+			usb_clear_halt(usbdev, outpipe);
+			usb_clear_halt(usbdev, inpipe);
+			if (!acxusb_1450_wait_ready(usbdev, inpipe, usbbuf)) {
+				pr_err("acxusb: device not ready for firmware upload "
+				       "after reset, please replug the stick\n");
+				goto fw_end;
+			}
 		}
 		pr_info("acxusb: device ready, radio type 0x%02X\n", usbbuf[8]);
 
