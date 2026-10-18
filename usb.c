@@ -1193,7 +1193,9 @@ static void acxusb_poll_rx(acx_device_t * adev, usb_rx_t * rx)
 
 	/* ATOMIC: we may be called from complete_rx() usb callback */
 	errcode = usb_submit_urb(rxurb, GFP_ATOMIC);
-	/* FIXME: evaluate the error code! */
+	if (unlikely(errcode))
+		printk_ratelimited(KERN_ERR "acxusb: rx urb %d submit failed: %d\n",
+				   rxnum, errcode);
 	log(L_USBRXTX,
 		"acx: SUBMIT RX (%d) inpipe=0x%X size=%d errcode=%d\n",
 		rxnum, inpipe, (int)RXBUFSIZE, errcode);
@@ -1458,20 +1460,11 @@ void acxusb_tx_data(acx_device_t *adev, tx_t *tx_opaque, int wlanpkt_len,
  */
 static void acxusb_unlink_urb(struct urb *urb)
 {
-	if (!urb)
-		return;
-
-	if (urb->status == -EINPROGRESS) {
-		int timeout = 10;
-
-		usb_unlink_urb(urb);
-		while (--timeout && urb->status == -EINPROGRESS) {
-			mdelay(1);
-		}
-		if (!timeout) {
-			pr_err("urb unlink timeout!\n");
-		}
-	}
+	/* Synchronous: the old async unlink + 10 ms poll let a restart
+	 * resubmit a still-busy urb (-EBUSY, silently ignored), which left
+	 * rx dead after NetworkManager's down/up for MAC randomisation. */
+	if (urb)
+		usb_kill_urb(urb);
 }
 
 #ifdef HAVE_TX_TIMEOUT
@@ -1488,6 +1481,10 @@ void acxusb_i_tx_timeout(struct net_device *ndev)
 */	/* unlink the URBs */
 /*	for (i = 0; i < ACX_TX_URB_CNT; i++) {
 		acxusb_unlink_urb(adev->usb_tx[i].urb);
+		if (adev->usb_tx[i].skb) {
+			ieee80211_free_txskb(adev->hw, adev->usb_tx[i].skb);
+			adev->usb_tx[i].skb = NULL;
+		}
 		adev->usb_tx[i].busy = 0;
 	}
 	adev->tx_free = ACX_TX_URB_CNT;
@@ -1553,9 +1550,10 @@ static int acxusb_op_start(struct ieee80211_hw *hw)
 	/* acx_start needs it */
 	acx_update_settings(adev);
 
-	acxusb_poll_rx(adev, &adev->usb_rx[0]);
-
+	/* HW_UP first: complete_rx() drops (and doesn't resubmit) while down */
 	set_bit(ACX_FLAG_HW_UP, &adev->flags);
+
+	acxusb_poll_rx(adev, &adev->usb_rx[0]);
 
 	acx_wake_queue(adev->hw, NULL);
 
@@ -1602,6 +1600,10 @@ static void acxusb_op_stop(struct ieee80211_hw *hw, bool suspend)
 	// OW TODO Maybe we need to report pending skbs in urbs still to mac80211 ? see wl1251 flush
 	for (i = 0; i < ACX_TX_URB_CNT; i++) {
 		acxusb_unlink_urb(adev->usb_tx[i].urb);
+		if (adev->usb_tx[i].skb) {
+			ieee80211_free_txskb(adev->hw, adev->usb_tx[i].skb);
+			adev->usb_tx[i].skb = NULL;
+		}
 		adev->usb_tx[i].busy = 0;
 	}
 	for (i = 0; i < ACX_RX_URB_CNT; i++) {
