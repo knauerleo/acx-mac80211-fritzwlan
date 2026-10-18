@@ -109,7 +109,7 @@ Example: `18 80 3d ea 00 00 00 00 40 00 01 00 00 00 00 00 00 00 00 00 00 00 00 0
 
 ```
 +0   0x8018           type 2, len 24
-+2   u8 seq, u8 0xea
++2   u8 seq (= tx descriptor byte 14 of the frame), u8 0xea
 +8   le16 frame control of the sent frame
 +10  u16 rate bitmask (RATE111_*) actually allowed
 +0x12 u8 status       0x00 ok, 0x20 failed after retries (8), 0x08 seen as well
@@ -118,9 +118,23 @@ Example: `18 80 3d ea 00 00 00 00 40 00 01 00 00 00 00 00 00 00 00 00 00 00 00 0
 +0x17 u8 PLCP rate used (0x0a = 1M, 0x0b = 6M OFDM, ...)
 ```
 
-There is no host cookie in it, and Windows only counts completions per queue
-(FUN_0004317e). The driver completes skbs on URB completion and ignores these
-records except for debugging.
+There is no host cookie in it, but **byte 2 echoes the tx descriptor's
+sequence byte 14** (seen on every frame of a 1000-frame trace), so a record
+can be matched to its frame exactly. Records come in submit order; under
+overload (see credits below) some get lost or arrive late.
+
+**The records are tx credits.** TI's `usbTx_SendOneMsdu` counts `sent++` per
+hw queue (+0x2c), every record runs `usbTx_Clean` (`completed++`, +0x30; a
+record with nothing outstanding counts as the firmware's own frame, +0x40),
+and `usbTx_CheckSize` refuses to send while `sent - completed > 7`. So at most
+**8 frames per hw queue** may be in the firmware without a status. A host that
+keeps sending anyway (acx released its buffers on URB completion) makes the
+firmware stop transmitting under sustained load, without any USB error.
+`usbTx_TxCmplt` passes status, retries and both rate bytes to the upper layer.
+
+The driver completes each skb from its record (ACK, retry count, rate) and
+stops the mac80211 queue at 8 frames without status (module parameters
+`txstat`, `txcredits`).
 
 The firmware itself sometimes transmits frames the host never queued: type-2
 status records with frame control `0x0040` (probe request) show up on an
@@ -187,6 +201,8 @@ IDs and lengths from `fwlanusb-lib.o` `whal_hwInfoElem*`, values read live
 | 0x0023 | PacketDetectionThreshold | 4 | 0x70 |
 | 0x0025 | CcaThreshold | 2 | 0xffef |
 | 0x0027 | DtimPeriod | 2 | interrogate fails |
+| 0x000b | TxPowerLevelTable (`whal_hwInfoElemTxPowerLevelTable`) | 0x18 | interrogate fails; TI writes `u32 1` + a 20-byte table |
+| 0x100d | TxPowerLevel (`whal_hwInfoElemTxPowerLevel`) | 2 | **1 after boot = full power**. 1 byte level 1..5 (+1 pad byte); 5 = lowest. See "Tx power" |
 | 0x100b | CurrAntenna | 2 | `4a 04` (fw default). TI writes rx byte from `dot11RxAntenna` (default 2): 1→0x0a, 2→0x2a, 3→0x4a, 4→0x6a; tx byte from `dot11TxAntenna` (default 2 → 0x04). Changing rx made no measurable difference |
 
 ## Radio control in TI's host stack (not in acx)
@@ -201,6 +217,37 @@ hardware ACI settings (`HardwareACIMode` 0, `InputCCA` 1, `QualifiedCCA` 3,
 `EnergyDetection` 255. Once suspected for the time-varying rx loss, but that was
 the driver's signal reporting (garbage CQM RSSI → bgscan loop, fixed in 5662f64).
 Still relevant if sensitivity at a distance turns out to be poor.
+
+## Tx power and the "AP falls back to 1M" collapse
+
+acx never set the tx power on USB, so the firmware stays at its boot level 1
+(full power). Measured with the stick about 1 m from the router (-26…-33 dBm):
+
+| tx level (IE 0x100d) | sustained OFDM traffic | result |
+|---|---|---|
+| 1 (boot default) | download, tx at 54M | AP→stick rate drops to 1 Mbit/s after ~20 s, download ~0.1 MB/s |
+| 3 | download | held ~60 s, then the same |
+| 5 | download, 4 × 20 s | held: 1.8–2.2 MB/s, AP stays at 48/54M |
+| 5 | 20 s upload at 0.7 MB/s | collapsed afterwards |
+
+In the collapsed state only the AP→stick direction is broken: our own upload
+keeps running at 0.7 MB/s, but the AP sends to us at 1M (the 802.11 rx bitrate
+during a download is 1.0), the medium is busy with those slow frames, our TCP
+ACKs wait, and their status records run into the 500 ms timeout. The state
+lasts minutes and survives a firmware reboot (module reload); cooling the
+stick with a fan brought it back without a reload. The installed driver
+before the tx status work never left 1M/6M for its own frames and did not
+show it.
+
+Not solved. Candidates: receiver overload next to the AP (OFDM needs a linear
+receiver, 1M DSSS does not) with gain control (LNA/AGC) stuck after tx bursts,
+heat, or both. TI's host stack has the tools that acx lacks: per-rate power
+levels (`TxPowerLevel_24_11B`, `_6_9_12`, `_18_24_36`, `_48_54`), a power
+control that lowers tx power near the AP (`TxPowerControlOn`,
+`TxPowerRssiThresh`, `TxPowerRssiRestoreThresh`) and the LNA/ACI control
+below. Not yet tested at a distance from the router.
+
+The driver now sets the level and caps it at 5 by default (`txpower_max`).
 
 ## Driver-side pitfalls fixed during the port (acx-mac80211 branch `port-7.2`)
 
@@ -222,5 +269,11 @@ Still relevant if sensitivity at a distance turns out to be poor.
   survives `CMD_RESET`) the firmware held each bulk-out tx frame until the
   next one arrived: exactly 50 % ping loss, alternating, at any tx rate.
   Now counts packets like AVM's glue (commit 64efc85).
-- `debugflags=` name table is shifted against the real bit values. Use the
-  numeric `debug=` instead (0x8282 = USBRXTX|XFER|DEBUG|INIT; 0x100 = L_DATA).
+- `debugflags=` name table was shifted against the real bit values (fixed;
+  numeric `debug=` works too: 0x8282 = USBRXTX|XFER|DEBUG|INIT, 0x100 = L_DATA,
+  0x2000 = L_TXSTAT, one line per tx frame / status record / rx rate).
+- Every tx frame was completed on URB completion with ACK set and rate count 0:
+  minstrel never learned anything (tx stuck at 1M/6M), and nothing limited the
+  frames in flight → tx stall under sustained upload. Now completed from the
+  type-2 records with TI's credit limit (commit eb96475).
+- rx `rate_idx` was never set (the old helper used the wrong index order).
