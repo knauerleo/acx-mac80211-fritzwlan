@@ -253,7 +253,7 @@ acxusb_boot(struct usb_device *usbdev, int is_tnetw1450, int *radio_type)
 
 	/* dump_device(usbdev); */
 
-	usbbuf = kmalloc(USB_RWMEM_MAXLEN, GFP_KERNEL);
+	usbbuf = kmalloc(USB_RWMEM_MAXLEN + 32, GFP_KERNEL);
 	if (!usbbuf) {
 		pr_err("no memory for USB transfer buffer (%d bytes)\n",
 		       USB_RWMEM_MAXLEN);
@@ -279,8 +279,11 @@ acxusb_boot(struct usb_device *usbdev, int is_tnetw1450, int *radio_type)
 				break;
 			acx_mwait(10);
 		}
-		if (i == 2)
+		if (i > 2) {
+			pr_err("acxusb: device not ready for firmware upload (result %d)\n", result);
 			goto fw_end;
+		}
+		pr_info("acxusb: device ready, radio type 0x%02X\n", usbbuf[8]);
 
 		*radio_type = usbbuf[8];
 	} else {
@@ -305,11 +308,12 @@ acxusb_boot(struct usb_device *usbdev, int is_tnetw1450, int *radio_type)
 	img_checksum = le32_to_cpu(fw_image->chksum);
 
 	if (is_tnetw1450) {
-		u8 cmdbuf[20];
+		u8 *cmdbuf;
 		const u8 *p;
 		u8 need_padding;
 		u32 tmplen, val;
 
+		cmdbuf = usbbuf + USB_RWMEM_MAXLEN;	/* DMA-safe, not on stack */
 		memset(cmdbuf, 0, 16);
 
 		need_padding =
@@ -524,7 +528,7 @@ acxusb_issue_cmd_timeo_debug(acx_device_t * adev,
 	struct {
 		u16 cmd;
 		u16 status;
-		u8 data[1];
+		u8 data[];
 	} ACX_PACKED *loc;
 	const char *devname;
 	int acklen, blocklen, inpipe, outpipe;
@@ -1570,7 +1574,11 @@ acxusb_probe(struct usb_interface *intf, const struct usb_device_id *devID)
 
 	if (is_tnetw1450) {
 		/* Boot the device (i.e. upload the firmware) */
-		acxusb_boot(usbdev, is_tnetw1450, &radio_type);
+		result = acxusb_boot(usbdev, is_tnetw1450, &radio_type);
+		if (result) {
+			pr_err("acxusb: TNETW1450 firmware boot failed: %d\n", result);
+			return result;
+		}
 
 		/* TNETW1450-based cards will continue right away with
 		 * the same USB ID after booting */
