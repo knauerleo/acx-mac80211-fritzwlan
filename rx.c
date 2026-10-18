@@ -200,8 +200,16 @@ void acx_process_rxbuf(acx_device_t *adev, rxbuffer_t *rxbuf)
 {
 	struct ieee80211_hdr *hdr;
 	u16 fc, buf_len;
+	int raw_len = le16_to_cpu(rxbuf->mac_cnt_rcvd) & 0xfff;
 
-
+	/* A bogus length would turn into a huge memcpy in acx_rx() and
+	 * overwrite kernel memory -- the old "kills kernel on scans" bug. */
+	if (unlikely(raw_len <= adev->phy_header_len + 10 ||
+		     raw_len - adev->phy_header_len > WLAN_A4FR_MAXLEN_FCS)) {
+		printk_ratelimited(KERN_WARNING "acx: rx: dropping frame with bogus length %d\n",
+				   raw_len);
+		return;
+	}
 
 	hdr = acx_get_wlan_hdr(adev, rxbuf);
 	fc = le16_to_cpu(hdr->frame_control);

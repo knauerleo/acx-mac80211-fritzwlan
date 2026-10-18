@@ -914,6 +914,12 @@ static void acxusb_complete_rx(struct urb *urb)
 	if (unlikely(!size))
 		pr_acx("warning, encountered zerolength rx packet\n");
 
+	if (urb->status == 0 && size && net_ratelimit()) {
+		pr_info("acxusb: rx urb %d: %d bytes\n", rxnum, size);
+		print_hex_dump(KERN_INFO, "acxusb rx: ", DUMP_PREFIX_OFFSET,
+			       16, 1, inbuf, min(size, 96), false);
+	}
+
 	if (urb->transfer_buffer != inbuf)
 		return;
 
