@@ -316,11 +316,8 @@ acxusb_boot(struct usb_device *usbdev, int is_tnetw1450, int *radio_type)
 		cmdbuf = usbbuf + USB_RWMEM_MAXLEN;	/* DMA-safe, not on stack */
 		memset(cmdbuf, 0, 16);
 
-		/* fwlanusb.sys (FUN_00014b12) divides by the bulk endpoint's
-		 * wMaxPacketSize, not by the 2048-byte transfer block size */
 		need_padding =
-		    acxusb_fw_needs_padding(fw_image, usb_maxpacket(usbdev, outpipe));
-		pr_info("acxusb: need_padding=%d (maxpacket %d)\n", need_padding, usb_maxpacket(usbdev, outpipe));
+		    acxusb_fw_needs_padding(fw_image, USB_RWMEM_MAXLEN);
 		tmplen = need_padding ? file_size - 4 : file_size - 8;
 		*(u16 *) & cmdbuf[0] = 0xc000;
 		*(u16 *) & cmdbuf[2] = 0x000b;
@@ -392,21 +389,19 @@ acxusb_boot(struct usb_device *usbdev, int is_tnetw1450, int *radio_type)
 		result =
 		    usb_bulk_msg(usbdev, inpipe, cmdbuf, 20, &num_processed,
 				 2000);
-		pr_info("acxusb: fw upload result read: %d (%u bytes)\n", result, num_processed);
-		print_hex_dump(KERN_INFO, "acxusb resp: ", DUMP_PREFIX_OFFSET, 16, 1, cmdbuf, 20, false);
 		if (result < 0)
-			{ pr_err("acxusb: fw upload check 1 failed (result %d, got %u)\n", result, num_processed); print_hex_dump(KERN_ERR, "acxusb resp: ", DUMP_PREFIX_OFFSET, 16, 1, cmdbuf, 20, false); goto fw_end; }
+			goto fw_end;
 		if (*(u32 *) & cmdbuf[4] == 0x40000003)
-			{ pr_err("acxusb: fw upload check 2 failed (result %d, got %u)\n", result, num_processed); print_hex_dump(KERN_ERR, "acxusb resp: ", DUMP_PREFIX_OFFSET, 16, 1, cmdbuf, 20, false); goto fw_end; }
+			goto fw_end;
 		if (*(u32 *) & cmdbuf[4])
-			{ pr_err("acxusb: fw upload check 3 failed (result %d, got %u)\n", result, num_processed); print_hex_dump(KERN_ERR, "acxusb resp: ", DUMP_PREFIX_OFFSET, 16, 1, cmdbuf, 20, false); goto fw_end; }
+			goto fw_end;
 		if (*(u16 *) & cmdbuf[16] != 1)
-			{ pr_err("acxusb: fw upload check 4 failed (result %d, got %u)\n", result, num_processed); print_hex_dump(KERN_ERR, "acxusb resp: ", DUMP_PREFIX_OFFSET, 16, 1, cmdbuf, 20, false); goto fw_end; }
+			goto fw_end;
 
 		val = *(u32 *) & cmdbuf[0];
 		if ((val & 0x3fff)
 		    || ((val & 0xc000) != 0xc000))
-			{ pr_err("acxusb: fw upload check 5 failed (result %d, got %u)\n", result, num_processed); print_hex_dump(KERN_ERR, "acxusb resp: ", DUMP_PREFIX_OFFSET, 16, 1, cmdbuf, 20, false); goto fw_end; }
+			goto fw_end;
 
 		val = *(u32 *) & cmdbuf[8];
 		if (val & 2) {
