@@ -1872,8 +1872,10 @@ void acx_set_defaults(acx_device_t *adev)
 		/* start with sensitivity level 2 out of 3: */
 		adev->sensitivity = 2;
 
-	/* Enable hw-encryption (normally by default enabled) */
-	if (acx_hwcrypto)
+	/* Enable hw-encryption (normally by default enabled).
+	 * TNETW1450 USB: keys are refused (software crypto), so the firmware
+	 * must pass encrypted frames through instead of dropping them. */
+	if (acx_hwcrypto && !(IS_USB(adev) && IS_ACX111(adev)))
 		acx_set_hw_encryption_on(adev);
 	else
 		acx_set_hw_encryption_off(adev);
