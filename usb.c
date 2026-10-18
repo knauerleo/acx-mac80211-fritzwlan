@@ -1351,6 +1351,74 @@ void *acxusb_get_txbuf(acx_device_t * adev, tx_t * tx_opaque)
  * Can be called from IRQ (rx -> (AP bridging or mgmt response) -> tx).
  * Can be called from acx_i_start_xmit (data frames from net core).
  */
+/*
+ * TNETW1450 bulk-out header, as built by fwlanusb.sys FUN_00043014:
+ *   0  le16 802.11 frame length (without this header)
+ *   2  u8   hw queue
+ *   3  u8   flags: 0x10 always, 0x20 RTS, 0x01/0x02 (unknown), 0x80 special
+ *   4  le32 per-frame value from the packet context (unknown, 0 here)
+ *   8  le16 allowed rates, acx111 RATE111_* bitmask (|0x8000, |0x4000: unknown)
+ *  10  u8   per-frame parameter (unknown, 0 here)
+ *  11  u8   PLCP rate (0x0a=1M 0x14=2M 0x37=5.5M 0x6e=11M, OFDM signal codes)
+ *  12  le16 frame control of the 802.11 frame
+ *  14  u8   running sequence counter
+ *  15  u8   0
+ * The classic acx usb_txbuffer_t header (desc 0x000a first) is read by the
+ * firmware as a 10-byte record and wedges it.
+ */
+#define ACXUSB_1450_TXHDRLEN 16
+
+static void acxusb_1450_rate(u16 rate_100, u16 *mask, u8 *plcp)
+{
+	static const struct { u16 r100; u16 mask; u8 plcp; } map[] = {
+		{ 10, 0x0001, 0x0a }, { 20, 0x0002, 0x14 }, { 55, 0x0004, 0x37 },
+		{ 60, 0x0008, 0x0b }, { 90, 0x0010, 0x0f }, { 110, 0x0020, 0x6e },
+		{ 120, 0x0040, 0x0a }, { 180, 0x0080, 0x0e }, { 240, 0x0200, 0x09 },
+		{ 360, 0x0400, 0x0d }, { 480, 0x0800, 0x08 }, { 540, 0x1000, 0x0c },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(map); i++)
+		if (map[i].r100 == rate_100) {
+			*mask = map[i].mask;
+			*plcp = map[i].plcp;
+			return;
+		}
+	*mask = 0x0001;		/* fall back to 1 Mbit/s */
+	*plcp = 0x0a;
+}
+
+/* Returns the number of bytes to send. */
+static int acxusb_1450_fill_txhdr(acx_device_t *adev, usb_txbuffer_t *txbuf,
+				  int wlanpkt_len, u16 rate_100)
+{
+	static u8 seq;
+	u8 *hdr = (u8 *)txbuf;
+	u8 *frame = hdr + ACXUSB_1450_TXHDRLEN;
+	u16 mask;
+	u8 plcp;
+
+	if (wlanpkt_len + 2 > sizeof(txbuf->data))
+		return -EMSGSIZE;
+
+	/* frame was copied right after the 14-byte classic header */
+	memmove(frame, txbuf->data, wlanpkt_len);
+
+	acxusb_1450_rate(rate_100, &mask, &plcp);
+	put_unaligned_le16(wlanpkt_len, hdr + 0);
+	hdr[2] = 0;
+	hdr[3] = 0x10;
+	put_unaligned_le32(0, hdr + 4);
+	put_unaligned_le16(mask, hdr + 8);
+	hdr[10] = 0;
+	hdr[11] = plcp;
+	memcpy(hdr + 12, frame, 2);	/* frame control */
+	hdr[14] = seq++;
+	hdr[15] = 0;
+
+	return wlanpkt_len + ACXUSB_1450_TXHDRLEN;
+}
+
 void acxusb_tx_data(acx_device_t *adev, tx_t *tx_opaque, int wlanpkt_len,
 		struct ieee80211_tx_info *ieeectl, struct sk_buff *skb)
 {
@@ -1361,8 +1429,8 @@ void acxusb_tx_data(acx_device_t *adev, tx_t *tx_opaque, int wlanpkt_len,
 	//	client_t *clt;
 	// FIXME Cleanup ?: struct ieee80211_hdr *whdr;
 	unsigned int outpipe;
-	int ucode, txnum;
-	u8 rate_100;
+	int ucode, txnum, txsize;
+	u16 rate_100;
 
 
 
@@ -1408,18 +1476,28 @@ void acxusb_tx_data(acx_device_t *adev, tx_t *tx_opaque, int wlanpkt_len,
 	usbdev = adev->usbdev;
 	outpipe = usb_sndbulkpipe(usbdev, adev->bulkoutep);
 
+	txsize = wlanpkt_len + USB_TXBUF_HDRSIZE;
+	if (IS_ACX111(adev)) {
+		txsize = acxusb_1450_fill_txhdr(adev, txbuf, wlanpkt_len, rate_100);
+		if (txsize < 0) {
+			pr_err("acxusb: tx frame too long (%d)\n", wlanpkt_len);
+			tx->busy = 0;
+			adev->hw_tx_queue[0].free++;
+			return;
+		}
+	}
+
 	usb_fill_bulk_urb(txurb, usbdev, outpipe, txbuf,	/* dataptr */
-			  wlanpkt_len + USB_TXBUF_HDRSIZE,	/* size */
+			  txsize,	/* size */
 			  acxusb_complete_tx,	/* handler */
 			  tx	/* handler param */
 	    );
 
 	txurb->transfer_flags = URB_ASYNC_UNLINK | URB_ZERO_PACKET;
 	if (net_ratelimit()) {
-		pr_info("acxusb: tx urb %d: %d bytes\n", txnum,
-			wlanpkt_len + USB_TXBUF_HDRSIZE);
+		pr_info("acxusb: tx urb %d: %d bytes\n", txnum, txsize);
 		print_hex_dump(KERN_INFO, "acxusb tx: ", DUMP_PREFIX_OFFSET, 16, 1,
-			       txbuf, min(wlanpkt_len + USB_TXBUF_HDRSIZE, 48), false);
+			       txbuf, min(txsize, 48), false);
 	}
 	ucode = usb_submit_urb(txurb, GFP_ATOMIC);
 	log(L_USBRXTX, "SUBMIT TX (%d): outpipe=0x%X buf=%p txsize=%d "
