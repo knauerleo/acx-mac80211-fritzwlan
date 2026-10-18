@@ -557,7 +557,7 @@ struct rxacxdesc {
 } ACX_PACKED;		/* size 52 = 0x34 */
 
 
-#if defined(CONFIG_ACX_MAC80211_PCI) || defined(CONFIG_ACX_MAC80211_MEM)
+#if 1 /* register enum needed by inlines.h on all builds */
 
 /* Register I/O offsets */
 #define ACX100_EEPROM_ID_OFFSET	0x380

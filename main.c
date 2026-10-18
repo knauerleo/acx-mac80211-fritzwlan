@@ -1121,7 +1121,10 @@ int acx_recover_hw(acx_device_t *adev)
 	log(L_ANY, "");
 
 	acx_remove_interface(adev, adev->vif);
-	acx_stop(adev);
+#if defined(CONFIG_ACX_MAC80211_PCI) || defined(CONFIG_ACX_MAC80211_MEM)
+	if (!IS_USB(adev))
+		acx_stop(adev);
+#endif
 
 	ieee80211_restart_hw(adev->hw);
 

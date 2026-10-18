@@ -11,3 +11,4 @@ modules.order
 build.log
 *.mod
 .*.cmd
+.*.d

@@ -1,8 +1,6 @@
 #ifndef _PCI_H_
 #define _PCI_H_
 
-int acxpci_upload_radio(acx_device_t *adev);
-
 int acxpci_write_fw(acx_device_t *adev, const firmware_image_t *fw_image,
                     u32 offset);
 int acxpci_validate_fw(acx_device_t *adev, const firmware_image_t *fw_image,
@@ -15,6 +13,7 @@ int acxpci_dbgfs_diag_output(struct seq_file *file, acx_device_t *adev);
 
 #if defined(CONFIG_ACX_MAC80211_PCI)
 
+int acxpci_upload_radio(acx_device_t *adev);
 void acxpci_process_rxdesc(acx_device_t *adev);
 
 void acxpci_reset_mac(acx_device_t *adev);

@@ -507,8 +507,8 @@ struct acx_device {
 
 
 
-	/*** PCI stuff ***/
-#if (defined(CONFIG_ACX_MAC80211_PCI) || defined(CONFIG_ACX_MAC80211_MEM))
+	/*** PCI stuff (always present; unused on USB-only builds) ***/
+#if 1
 	u8		irqs_active;	/* whether irq sending is activated */
 
 	const u16	*io;		/* points to ACX100 or ACX111 PCI I/O register address set */
@@ -518,7 +518,7 @@ struct acx_device {
 #endif
 	struct device *bus_dev;
 
-#if defined(CONFIG_ACX_MAC80211_PCI) || defined(CONFIG_ACX_MAC80211_MEM)
+#if 1
 	struct pci_dev	*pdev;
 	unsigned long	membase;
 	void __iomem	*iobase;
