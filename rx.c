@@ -150,7 +150,7 @@ static void acx_rx(acx_device_t *adev, rxbuffer_t *rxbuf)
 	 */
 	status->signal = level;
 
-	if(adev->hw_encrypt_enabled)
+	if (adev->hw_encrypt_enabled && !(IS_USB(adev) && IS_ACX111(adev)))
 		status->flag = RX_FLAG_DECRYPTED | RX_FLAG_IV_STRIPPED;
 
 	status->freq = adev->rx_status.freq;

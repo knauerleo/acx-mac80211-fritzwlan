@@ -836,6 +836,12 @@ int acx_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 	static const u8 bcast_addr[ETH_ALEN] =
 		{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
+	/* TNETW1450 USB: hw crypto not wired up in the tx trailer (the
+	 * descriptor has no key fields we understand yet) -- let mac80211
+	 * do CCMP/TKIP/WEP in software. */
+	if (IS_USB(adev) && IS_ACX111(adev))
+		return -EOPNOTSUPP;
+
 	acx_sem_lock(adev);
 
 	addr = sta ? sta->addr : bcast_addr;
